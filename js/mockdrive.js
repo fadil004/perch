@@ -1,0 +1,239 @@
+// In-browser stand-in for the slice of Google Drive v3 that Perch uses.
+// It answers files.list (with the real q grammar), files.get and alt=media from a static manifest
+// (tools/make_mock_manifest.py), so demo mode exercises the same sync code as production.
+import { FOLDER } from './drive.js';
+import { sleep } from './util.js';
+
+const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
+const fail = (status, message) => json({ error: { code: status, message, errors: [{ reason: status === 400 ? 'invalid' : 'notFound', message }] } }, status);
+
+// ── q grammar ────────────────────────────────────────────────────────────────
+function tokenize(q) {
+  const out = [];
+  let i = 0;
+  while (i < q.length) {
+    const c = q[i];
+    if (/\s/.test(c)) { i++; continue; }
+    if (c === "'") {
+      let s = '';
+      i++;
+      while (i < q.length && q[i] !== "'") {
+        if (q[i] === '\\' && i + 1 < q.length) { s += q[i + 1]; i += 2; } else s += q[i++];
+      }
+      if (q[i] !== "'") throw new Error('unterminated string');
+      i++;
+      out.push({ t: 'str', v: s });
+      continue;
+    }
+    if (c === '(' || c === ')') { out.push({ t: c }); i++; continue; }
+    if (c === '!' && q[i + 1] === '=') { out.push({ t: 'op', v: '!=' }); i += 2; continue; }
+    if (c === '=') { out.push({ t: 'op', v: '=' }); i++; continue; }
+    const m = /^[A-Za-z_][\w.]*/.exec(q.slice(i));
+    if (!m) throw new Error(`unexpected "${c}"`);
+    const w = m[0], lw = w.toLowerCase();
+    i += w.length;
+    if (lw === 'and' || lw === 'or' || lw === 'not') out.push({ t: lw });
+    else if (lw === 'contains' || lw === 'in') out.push({ t: 'op', v: lw });
+    else if (lw === 'true' || lw === 'false') out.push({ t: 'bool', v: lw === 'true' });
+    else out.push({ t: 'id', v: w });
+  }
+  return out;
+}
+
+export function parseQuery(q) {
+  const toks = tokenize(q);
+  let p = 0;
+  const peek = () => toks[p];
+  const eat = (t) => { const k = toks[p]; if (!k || k.t !== t) throw new Error(`expected ${t}`); p++; return k; };
+  const expr = () => { let l = term(); while (peek()?.t === 'or') { p++; l = { or: [l, term()] }; } return l; };
+  const term = () => { let l = factor(); while (peek()?.t === 'and') { p++; l = { and: [l, factor()] }; } return l; };
+  const factor = () => {
+    const k = peek();
+    if (!k) throw new Error('unexpected end of query');
+    if (k.t === 'not') { p++; return { not: factor() }; }
+    if (k.t === '(') { p++; const e = expr(); eat(')'); return e; }
+    if (k.t === 'str') {
+      p++;
+      const op = eat('op');
+      if (op.v !== 'in') throw new Error('expected "in"');
+      return { inField: eat('id').v, value: k.v };
+    }
+    if (k.t === 'id') {
+      p++;
+      const op = eat('op');
+      const val = toks[p++];
+      if (!val || (val.t !== 'str' && val.t !== 'bool')) throw new Error('bad value');
+      return { field: k.v, op: op.v, value: val.v };
+    }
+    throw new Error(`unexpected ${k.t}`);
+  };
+  if (!toks.length) return null;
+  const tree = expr();
+  if (p !== toks.length) throw new Error('trailing input');
+  return tree;
+}
+
+function matches(n, f) {
+  if (!n) return true;
+  if (n.or) return matches(n.or[0], f) || matches(n.or[1], f);
+  if (n.and) return matches(n.and[0], f) && matches(n.and[1], f);
+  if (n.not) return !matches(n.not, f);
+  if (n.inField) return n.inField === 'parents' && (f.parents || []).includes(n.value);
+  const v = n.field === 'trashed' ? !!f.trashed : f[n.field];
+  if (n.op === '=') return v === n.value;
+  if (n.op === '!=') return v !== n.value;
+  if (n.op === 'contains') return typeof v === 'string' && v.toLowerCase().includes(String(n.value).toLowerCase());
+  return false;
+}
+
+const countParents = (n) => !n ? 0 : n.or ? countParents(n.or[0]) + countParents(n.or[1]) : n.and ? countParents(n.and[0]) + countParents(n.and[1]) : n.not ? countParents(n.not) : n.inField ? 1 : 0;
+
+/** Parent ids a result must have, or null when the query doesn't constrain parents (for indexing). */
+function parentScope(n) {
+  if (!n) return null;
+  if (n.inField === 'parents') return [n.value];
+  if (n.or) { const a = parentScope(n.or[0]), b = parentScope(n.or[1]); return a && b ? a.concat(b) : null; }
+  if (n.and) return parentScope(n.and[0]) || parentScope(n.and[1]);
+  return null;
+}
+
+// ── mock ─────────────────────────────────────────────────────────────────────
+export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, mutate = false, maxParents = 30 } = {}) {
+  const base = new URL(manifestUrl, location.href);
+  const res = await fetch(base, { cache: 'no-cache' });
+  if (!res.ok) throw new Error(`Demo manifest not found (${res.status})`);
+  const manifest = await res.json();
+
+  const files = new Map();
+  const kids = new Map();
+  const add = (f) => {
+    files.set(f.id, f);
+    for (const p of f.parents || []) { if (!kids.has(p)) kids.set(p, []); kids.get(p).push(f); }
+  };
+  const remove = (id) => {
+    const f = files.get(id);
+    if (!f) return;
+    files.delete(id);
+    for (const p of f.parents || []) kids.set(p, (kids.get(p) || []).filter((x) => x.id !== id));
+    for (const c of kids.get(id) || []) remove(c.id);
+  };
+  for (const f of manifest.files) add({ ...f, trashed: false, url: f.url ? new URL(f.url, base).href : null });
+
+  const children = (id) => kids.get(id) || [];
+  const libraries = [...files.values()].filter((f) => f.mimeType === FOLDER && /\.library$/i.test(f.name));
+  const piece = (libId, name, folder = false) => children(libId).find((f) => f.name === name && (f.mimeType === FOLDER) === folder);
+
+  // Virtual JSON overrides (cloned items, mutated items, rewritten mtime.json)
+  const patches = new Map(); // fileId -> async () => object
+
+  if (scale > 0) {
+    let serial = 0;
+    for (const lib of libraries) {
+      const images = piece(lib.id, 'images', true);
+      const mtimeFile = piece(lib.id, 'mtime.json');
+      if (!images || !mtimeFile) continue;
+      const real = children(images.id).filter((f) => f.mimeType === FOLDER && f.name.endsWith('.info') && children(f.id).some((c) => c.name === 'metadata.json'));
+      if (!real.length) continue;
+      const extra = {};
+      for (let n = real.length, k = 0; n < scale; n++, k++) {
+        const src = real[k % real.length];
+        const itemId = `Z${(serial++).toString(36).toUpperCase().padStart(12, '0')}`;
+        const folderId = `clone-${lib.id.slice(0, 6)}-${itemId}`;
+        add({ id: folderId, name: `${itemId}.info`, mimeType: FOLDER, parents: [images.id], modifiedTime: src.modifiedTime, trashed: false });
+        const shift = (k + 1) * 3_600_000;
+        children(src.id).forEach((c, ci) => {
+          const id = `${folderId}-${ci}`;
+          add({ ...c, id, parents: [folderId] });
+          if (c.name === 'metadata.json') {
+            patches.set(id, async () => {
+              const j = await (await fetch(c.url)).json();
+              return { ...j, id: itemId, btime: (j.btime || 0) - shift, mtime: (j.mtime || 0) - shift };
+            });
+          }
+        });
+        extra[itemId] = 1_700_000_000_000 + n;
+      }
+      const prev = patches.get(mtimeFile.id);
+      patches.set(mtimeFile.id, async () => {
+        const base0 = prev ? await prev() : await (await fetch(mtimeFile.url)).json();
+        const merged = { ...base0, ...extra };
+        merged.all = Object.keys(merged).filter((k) => k !== 'all').length;
+        return merged;
+      });
+    }
+  }
+
+  // ?mutate=1 — simulate edits made in Eagle desktop since the last sync: 2 edited items, 1 removed item.
+  if (mutate) {
+    for (const lib of libraries) {
+      const images = piece(lib.id, 'images', true);
+      const mtimeFile = piece(lib.id, 'mtime.json');
+      if (!images || !mtimeFile) continue;
+      const infos = children(images.id).filter((f) => f.mimeType === FOLDER && children(f.id).some((c) => c.name === 'metadata.json'));
+      const edited = infos.slice(0, 2), gone = infos[2];
+      const editedIds = edited.map((f) => f.name.replace(/\.info$/, ''));
+      for (const f of edited) {
+        const meta = children(f.id).find((c) => c.name === 'metadata.json');
+        const prev = patches.get(meta.id);
+        patches.set(meta.id, async () => {
+          const j = prev ? await prev() : await (await fetch(meta.url)).json();
+          return { ...j, mtime: Date.now(), tags: [...new Set([...(j.tags || []), 'edited'])] };
+        });
+      }
+      const goneId = gone ? gone.name.replace(/\.info$/, '') : null;
+      if (gone) remove(gone.id);
+      const prevM = patches.get(mtimeFile.id);
+      patches.set(mtimeFile.id, async () => {
+        const m = prevM ? await prevM() : await (await fetch(mtimeFile.url)).json();
+        const out = { ...m };
+        for (const id of editedIds) out[id] = Date.now();
+        if (goneId) delete out[goneId];
+        out.all = Object.keys(out).filter((k) => k !== 'all').length;
+        return out;
+      });
+    }
+  }
+
+  const strip = (f) => {
+    const { url, trashed, ...rest } = f;
+    return rest;
+  };
+
+  async function backend({ path, params }) {
+    await sleep(latency * (0.6 + Math.random() * 0.8));
+    if (path === 'files') {
+      let tree;
+      try { tree = parseQuery(params.q || ''); } catch (e) { return fail(400, `Invalid Value: ${e.message}`); }
+      if (countParents(tree) > maxParents) return fail(400, 'The query is too complex.');
+      const scope = parentScope(tree);
+      const pool = scope ? [...new Set(scope)].flatMap(children) : [...files.values()];
+      const hits = pool.filter((f) => matches(tree, f));
+      const size = Math.min(Number(params.pageSize) || 100, 1000);
+      const start = Number(params.pageToken || 0);
+      const page = hits.slice(start, start + size).map(strip);
+      return json(start + size < hits.length ? { files: page, nextPageToken: String(start + size) } : { files: page });
+    }
+    const m = /^files\/(.+)$/.exec(path);
+    if (m) {
+      const id = decodeURIComponent(m[1]);
+      const f = files.get(id);
+      if (!f) return fail(404, `File not found: ${id}`);
+      if (params.alt === 'media') {
+        if (patches.has(id)) return json(await patches.get(id)());
+        if (!f.url) return fail(404, 'No content');
+        return fetch(f.url);
+      }
+      return json(strip(f));
+    }
+    return fail(404, 'Unknown endpoint');
+  }
+
+  /** fileId -> absolute URL, for the service worker's ./media/<id> route. */
+  function mediaMap() {
+    const out = {};
+    for (const f of files.values()) if (f.url && f.mimeType !== FOLDER && f.name !== 'metadata.json') out[f.id] = f.url;
+    return out;
+  }
+
+  return { backend, mediaMap, fileCount: () => files.size };
+}

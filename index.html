@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Perch">
+<meta name="format-detection" content="telephone=no">
+<meta name="description" content="Your Eagle library, in your pocket.">
+<title>Perch</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/app.css">
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+
+<!-- Onboarding -->
+<section id="onboard" class="screen onboard" hidden>
+  <div class="wall" id="wall" aria-hidden="true"></div>
+  <div class="onboard-body">
+    <div class="mark" id="mark"></div>
+    <h1 class="wordmark">Perch</h1>
+    <p class="tagline">Your Eagle library, in your pocket.</p>
+  </div>
+  <div class="onboard-actions">
+    <button class="btn-primary" id="btn-connect" type="button">Connect Google Drive</button>
+    <div class="onboard-links">
+      <button class="btn-quiet" id="btn-demo" type="button">Try demo</button>
+      <span class="link-sep" id="install-sep" aria-hidden="true" hidden></span>
+      <button class="btn-quiet" id="btn-install" type="button" hidden>Install as app</button>
+    </div>
+  </div>
+</section>
+
+<!-- Library picker -->
+<section id="libs" class="screen libs" hidden>
+  <header class="libs-head">
+    <h1 class="large-title">Libraries</h1>
+    <p class="libs-sub" id="libs-sub"></p>
+  </header>
+  <ul class="lib-list" id="lib-list"></ul>
+  <div class="libs-foot">
+    <button class="btn-quiet" id="btn-paste" type="button">Paste a folder link</button>
+  </div>
+</section>
+
+<!-- First sync -->
+<section id="syncing" class="screen syncing" hidden>
+  <div class="sync-body">
+    <p class="sync-lib" id="sync-lib" dir="auto"></p>
+    <div class="bar"><i id="sync-bar"></i></div>
+    <p class="sync-count" id="sync-count"></p>
+  </div>
+</section>
+
+<!-- Library -->
+<main id="main" class="screen main" hidden>
+  <div class="topbar" id="topbar"><span class="topbar-title" id="topbar-title" dir="auto"></span></div>
+  <div class="ptr" id="ptr" aria-hidden="true"><svg viewBox="0 0 24 24"><circle class="ptr-track" cx="12" cy="12" r="9"/><circle class="ptr-arc" id="ptr-arc" cx="12" cy="12" r="9"/></svg></div>
+  <div class="content" id="content">
+    <header class="hero" id="hero">
+      <button class="lib-switch" id="lib-switch" type="button"><span id="lib-name" dir="auto"></span><span class="chev" id="lib-chev"></span></button>
+      <div class="title-row">
+        <h1 class="title" id="title" dir="auto"></h1>
+        <span class="count" id="count"></span>
+        <span class="spin" id="spin" hidden></span>
+      </div>
+      <div class="notice" id="notice" hidden></div>
+    </header>
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" hidden></div>
+  </div>
+</main>
+
+<!-- Search -->
+<div class="searchbar" id="searchbar" hidden>
+  <div class="search-row">
+    <label class="search-field">
+      <span class="search-ico" id="search-ico"></span>
+      <input id="search-input" type="search" placeholder="Search" enterkeyhint="search" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" dir="auto">
+      <button class="search-clear" id="search-clear" type="button" aria-label="Clear" hidden></button>
+    </label>
+    <button class="search-cancel" id="search-cancel" type="button">Cancel</button>
+  </div>
+  <div class="search-tags" id="search-tags"></div>
+</div>
+<div class="suggest" id="suggest" hidden></div>
+
+<!-- Dock -->
+<nav class="dock" id="dock" hidden>
+  <button type="button" data-act="folders" aria-label="Folders"></button>
+  <button type="button" data-act="search" aria-label="Search"></button>
+  <button type="button" data-act="more" aria-label="More"></button>
+</nav>
+
+<!-- Viewer -->
+<div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Viewer" hidden>
+  <div class="v-bg" id="v-bg"></div>
+  <div class="v-track" id="v-track"></div>
+  <div class="v-chrome" id="v-chrome">
+    <div class="v-top">
+      <button class="v-btn" id="v-close" type="button" aria-label="Close"></button>
+      <span class="v-counter" id="v-counter"></span>
+      <button class="v-btn" id="v-info-btn" type="button" aria-label="Info"></button>
+    </div>
+    <div class="v-bottom" id="v-bottom"></div>
+  </div>
+  <div class="v-info" id="v-info"></div>
+</div>
+
+<div class="sheets" id="sheets"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+</body>
+</html>
