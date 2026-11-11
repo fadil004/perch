@@ -93,6 +93,21 @@ every 20 s, and deletes finished requests after 7 days (errors after 14).
 Install on a computer: Eagle → Plugins → Developer options → Import plugin → the
 `eagle-video-downloader` folder. Needs Google Drive for desktop signed in to the same account as Perch.
 
+Plugin 1.4.0 (`perch-inbox.js`):
+- Finds the inbox in every Drive root: macOS `~/Library/CloudStorage/GoogleDrive-*` (and the
+  `~/<account> - Google Drive` alias, deduped by realpath), Windows drive letters D–Z one level down
+  (so a localized "My Drive" works), and the user folder (mirror mode, `Google Drive\My Drive`).
+  The user's library can live in a different Google account from the one Perch signs in with
+  (the user's case: library in one account, Perch Inbox in another); both accounts must then be in Drive for desktop.
+- Two computers on one library: each writes `computer-<host>.txt` (heartbeat, 2 min) and claims a
+  request with `<stem>.claim-<host>.txt` before taking it. Alone → takes it at once; with a live peer
+  on the same library → waits 60 s and the earliest claim wins. Claims expire after 10 min.
+- A link request for a post that was also sent as a video is marked done ("Already sent from the phone").
+- Copies uploads out with a stream; if Drive sends nothing for 2 min it backs off 3 min (not a failed try).
+- Logs "Watching the phone inbox: …" or "Can't find the Perch Inbox folder…" in the plugin window.
+- Tests that run the plugin must inject a fake `os.homedir()`/`env` and a path-guarded fs: on the dev Mac the
+  real home contains the live inbox.
+
 ## Open items
 
 - Confirm the background renew on the phone (no more "Refreshing…" flashes after an hour).
