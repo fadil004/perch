@@ -98,6 +98,7 @@ function parentScope(n) {
 }
 
 // ── mock ─────────────────────────────────────────────────────────────────────
+export const MOCK_CACHE = 'perch-mock';
 export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, mutate = false, maxParents = 30 } = {}) {
   const base = new URL(manifestUrl, location.href);
   const res = await fetch(base, { cache: 'no-cache' });
@@ -200,7 +201,30 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
   };
 
   let created = 0;
-  const sessions = new Map();   // resumable uploads in progress: session URL -> { meta, size, got }
+  const sessions = new Map();   // resumable uploads in progress: session URL -> { meta, size, got, parts }
+  const bytes = new Map();      // uploaded file id -> () => Promise<Blob>
+
+  // What Perch creates (the inbox, its requests and uploaded videos) is kept in the Cache API like a real
+  // Drive would keep it, so demo mode survives a reload. Reset by clearing site data or leaving the demo.
+  const keep = new URL(`__mock/`, document.baseURI).href;
+  const store = () => caches.open(MOCK_CACHE);
+  const save = (f, body = '') => store().then((c) => c.put(keep + encodeURIComponent(f.id), new Response(body, {
+    headers: { 'x-meta': encodeURIComponent(JSON.stringify(strip(f))), 'content-type': body instanceof Blob ? (body.type || 'application/octet-stream') : 'application/json' },
+  }))).catch(() => {});
+  const forget = (id) => store().then((c) => c.delete(keep + encodeURIComponent(id))).catch(() => {});
+  try {
+    const c = await store();
+    for (const req of await c.keys()) {
+      const res = await c.match(req);
+      if (!res) continue;
+      const f = { ...JSON.parse(decodeURIComponent(res.headers.get('x-meta') || '%7B%7D')), trashed: false };
+      if (!f.id) continue;
+      add(f);
+      if (f.mimeType === FOLDER) continue;
+      if ((res.headers.get('content-type') || '').startsWith('application/json')) { const text = await res.text(); patches.set(f.id, async () => JSON.parse(text)); }
+      else bytes.set(f.id, async () => (await c.match(req)).blob());
+    }
+  } catch { /* no Cache API: the demo inbox lasts for the session only */ }
   async function backend({ path, params, method = 'GET', meta, content, size }) {
     await sleep(latency * (0.6 + Math.random() * 0.8));
     if (method === 'POST' && path === 'files' && meta && params.uploadType === 'resumable') {
@@ -218,6 +242,7 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
       const f = { id: `new-${++created}-${Date.now().toString(36)}`, name: meta.name, mimeType: meta.mimeType, parents: meta.parents || ['root'], createdTime: now, modifiedTime: now, trashed: false };
       add(f);
       if (content != null) { const text = String(content); patches.set(f.id, async () => JSON.parse(text)); }
+      save(f, content != null ? String(content) : '');
       return json(strip(f));
     }
     if (path === 'files') {
@@ -239,6 +264,7 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
       if (!f) return fail(404, `File not found: ${id}`);
       if (params.alt === 'media') {
         if (patches.has(id)) return json(await patches.get(id)());
+        if (bytes.has(id)) { const b = await bytes.get(id)(); return new Response(b, { headers: { 'content-type': b.type || 'application/octet-stream', 'content-length': String(b.size) } }); }
         if (!f.url) return fail(404, 'No content');
         return fetch(f.url);
       }
@@ -257,6 +283,7 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
     if (!m || Number(m[1]) !== s.got) return res(400);
     const n = body ? body.size : 0;
+    if (body) (s.parts ||= []).push(body);
     for (let sent = 0; sent < n; ) {
       await sleep(40);
       sent = Math.min(n, sent + Math.max(256 * 1024, n / 12));
@@ -267,9 +294,25 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     const now = new Date().toISOString();
     const f = { id: `new-${++created}-${Date.now().toString(36)}`, name: s.meta.name, mimeType: s.meta.mimeType, parents: s.meta.parents || ['root'], size: String(s.got), createdTime: now, modifiedTime: now, trashed: false };
     add(f);
+    const blob = new Blob(s.parts || [], { type: s.meta.mimeType || '' });
+    bytes.set(f.id, async () => blob);
+    save(f, blob);
     s.file = strip(f);
     return res(200, {}, JSON.stringify(s.file));
   };
+
+  /** Stand in for Video Grabber on the computer: write back into a request (e.g. { status: 'done' }). */
+  async function writeBack(id, patch) {
+    const f = files.get(id);
+    if (!f || !patches.has(id)) throw new Error(`No request ${id}`);
+    const body = { ...(await patches.get(id)()), ...patch };
+    const text = JSON.stringify(body, null, 2);
+    patches.set(id, async () => JSON.parse(text));
+    f.modifiedTime = new Date().toISOString();
+    await save(f, text);
+  }
+  /** …and delete a file (the plugin removes the inbox video once Eagle has it). */
+  async function removeFile(id) { remove(id); bytes.delete(id); await forget(id); }
 
   /** fileId -> absolute URL, for the service worker's ./media/<id> route. */
   function mediaMap() {
@@ -278,5 +321,5 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     return out;
   }
 
-  return { backend, mediaMap, fileCount: () => files.size };
+  return { backend, mediaMap, fileCount: () => files.size, hasBytes: (id) => bytes.has(id), writeBack, removeFile };
 }

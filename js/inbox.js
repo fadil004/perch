@@ -83,6 +83,36 @@ export async function recentLinks(drive, modeKey, n = 6) {
   }));
 }
 
+const CACHE_KEY = (modeKey) => `perch.inbox.cache.${modeKey}`;
+const KEEP = ['kind', 'file', 'name', 'size', 'mimeType', 'url', 'library', 'sentAt', 'status', 'title', 'doneAt'];
+const VIDEO_FIELDS = 'id,name,size,mimeType,modifiedTime,thumbnailLink,videoMediaMetadata,imageMediaMetadata';
+
+/**
+ * Every video sent from the phone ('file' requests), newest first, each with its video's Drive file
+ * (`video`, null once the plugin has removed it). One list of the inbox; a request's JSON is only read
+ * again when Drive says it changed, so a refresh costs one call when nothing happened.
+ */
+export async function fileRequests(drive, modeKey) {
+  const folder = await inboxFolder(drive, modeKey);
+  if (!folder) return [];
+  const files = await drive.list(`'${folder}' in parents and trashed = false`, VIDEO_FIELDS);
+  const byName = new Map(files.map((f) => [f.name, f]));
+  const old = lsGet(CACHE_KEY(modeKey), {}) || {};
+  const cache = {};
+  const out = [];
+  await Promise.all(files.filter((f) => REQUEST_NAME.test(f.name)).map(async (f) => {
+    let body = old[f.id] && old[f.id].m === f.modifiedTime ? old[f.id].b : null;
+    if (!body) {
+      try { body = await drive.json(f.id); } catch { return; }
+      body = Object.fromEntries(KEEP.filter((k) => body[k] != null).map((k) => [k, body[k]]));
+    }
+    cache[f.id] = { m: f.modifiedTime, b: body };
+    if (body.kind === 'file') out.push({ ...body, id: f.id, stem: f.name.replace(/\.json$/, ''), video: byName.get(body.file) || null });
+  }));
+  lsSet(CACHE_KEY(modeKey), cache);
+  return out.sort((a, b) => b.stem.localeCompare(a.stem));
+}
+
 /** "instagram.com" from a URL, for compact rows. */
 export function siteOf(url) {
   try { return new URL(url).hostname.replace(/^(www|m)\./, ''); } catch { return url; }

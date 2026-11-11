@@ -845,6 +845,8 @@ export class Viewer {
     const kids = [h('div', { class: 'sheet-grab', id: 'v-info-grab' }, h('div', { class: 'sheet-handle' }))];
     kids.push(h('div', { class: 'i-title', dir: 'auto' }, it.name || 'Untitled'));
     if (meta) kids.push(h('div', { class: 'i-meta' }, meta));
+    // Sent from the phone, not in Eagle yet: say where it is (only here, never over the video).
+    if (it.pending) kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Status'), h('div', { class: 'i-note i-pending' }, it.pending.note)));
     if (it.star) {
       kids.push(h('div', { class: 'i-stars', 'aria-label': `${it.star} of 5` }, [1, 2, 3, 4, 5].map((k) => {
         const span = h('span', { html: I.star });

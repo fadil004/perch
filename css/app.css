@@ -365,6 +365,12 @@ h1, h2, p { margin: 0; }
 }
 .badge svg { width: 11px; height: 11px; stroke-width: 2; }
 .badge:empty { display: none; }
+/* Sent from the phone, not in Eagle yet: a tiny dot, and a hairline while it uploads. */
+.pmark { display: none; }
+.tile.pending .pmark { display: block; position: absolute; top: 7px; right: 7px; width: 6px; height: 6px; border-radius: 50%; background: rgba(255, 255, 255, .8); box-shadow: 0 0 0 1px rgba(0, 0, 0, .25); pointer-events: none; }
+.pbar { display: none; }
+.tile.uploading .pbar { display: block; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(0, 0, 0, .35); pointer-events: none; }
+.pbar i { display: block; height: 100%; width: 0; background: rgba(255, 255, 255, .85); transition: width 300ms linear; }
 
 .empty {
   padding: 18vh 32px 0;
@@ -1066,6 +1072,9 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .dl-card .up-bar { background: rgba(255, 255, 255, .1); }
 .dl.indet .up-bar i { width: 30%; animation: indet 1.1s var(--ease-ui) infinite; }
 .dl[data-state="done"] .up-bar { display: none; }
+.dl[data-state="done"] .link-meta { white-space: normal; line-height: 1.4; }
+.form .btn-primary:disabled { opacity: .35; transform: none; cursor: default; }
+.form .btn-quiet:disabled { opacity: .3; transform: none; cursor: default; }
 .dl[data-state="error"] .up-bar { display: none; }
 .dl[data-state="error"] .link-meta { color: #ff6961; white-space: normal; }
 .dl-media { margin-top: 10px; border-radius: 10px; overflow: hidden; background: #000; }

@@ -70,6 +70,16 @@ A web page can't fetch from Instagram/TikTok/YouTube (CORS), so yt-dlp runs in T
 - Cookies are deliberately NOT synced through Drive (login cookies shouldn't sit in cloud storage);
   the user adds a cookies.txt on the phone (Perch → Phone downloader → Add cookies file).
 
+## v12 — phone videos show in the library at once
+
+`js/pending.js`: videos sent from the phone that Eagle hasn't added yet appear as normal tiles at the top
+of "All" (only there), built from the upload queue plus inbox `kind:'file'` requests for the open library.
+Local frame thumbnail (`thumbStore` `pend:<stem>`), else Drive `thumbnailLink`/`videoMediaMetadata`.
+Plays from the phone copy (`local:<stem>`) until uploaded, then from Drive (`media/<fileId>`). A request
+turning `done` removes the tile and triggers a sync; never shown twice (`notInLibrary()`). The only marker
+is a tiny dot; the viewer's info panel says where it is. Download/Save buttons stay disabled while the
+link field is empty.
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

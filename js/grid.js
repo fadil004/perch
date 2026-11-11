@@ -102,7 +102,7 @@ export class Grid {
     this.h = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       const it = this.items[i];
-      const ratio = it.w > 0 && it.h > 0 ? clamp(it.h / it.w, 0.28, 3.2) : 1;
+      const ratio = it.w > 0 && it.h > 0 ? clamp(it.h / it.w, 0.28, 3.2) : it.ratio || 1;
       let col = 0;
       for (let c = 1; c < cols; c++) if (heights[c] < heights[col] - 0.5) col = c;
       const x0 = Math.round(col * (cw + GAP));
@@ -189,9 +189,11 @@ export class Grid {
     if (el) { el.hidden = false; return el; }
     const img = h('img', { alt: '', decoding: 'async', draggable: 'false' });
     const badge = h('span', { class: 'badge' });
-    const tile = h('div', { class: 'tile', role: 'button', tabindex: '0' }, h('div', { class: 'tile-in' }, img, badge));
+    const bar = h('i');
+    const tile = h('div', { class: 'tile', role: 'button', tabindex: '0' }, h('div', { class: 'tile-in' }, img, badge, h('span', { class: 'pmark' }), h('span', { class: 'pbar' }, bar)));
     tile._img = img;
     tile._badge = badge;
+    tile._bar = bar;
     this.el.append(tile);
     return tile;
   }
@@ -221,6 +223,7 @@ export class Grid {
     el.setAttribute('aria-label', it.name || it.ext);
     const badge = el._badge;
     badge.innerHTML = badgeHtml(it);
+    this.mark(el, it);
     const img = el._img;
     const tok = (el._tok = (el._tok || 0) + 1);
     const id = thumbIdOf(it);
@@ -230,13 +233,36 @@ export class Grid {
       img.src = hit;
       return;
     }
-    if (!id) return;
+    if (!id) {
+      if (!it.thumbUrl) return;
+      img.src = it.thumbUrl;   // a link Drive gave (a video sent from the phone, no copy kept yet)
+      const show = () => { if (el._tok === tok) img.classList.add('in'); };
+      if (img.decode) img.decode().then(show, () => {}); else img.onload = show;
+      return;
+    }
     loadThumb(id).then((url) => {
       if (!url || el._tok !== tok) return;
       img.src = url;
       const show = () => { if (el._tok === tok) requestAnimationFrame(() => img.classList.add('in')); };
       if (img.decode) img.decode().then(show, show); else img.onload = show;
     });
+  }
+
+  /**
+   * A video sent from the phone that Eagle hasn't added yet looks like any other tile, with a tiny dot,
+   * and a hairline along the bottom while it uploads.
+   */
+  mark(el, it) {
+    const p = it.pending;
+    el.classList.toggle('pending', !!p);
+    const up = p && p.upload;
+    el.classList.toggle('uploading', !!up);
+    el._bar.style.width = up && up.size ? `${Math.round((100 * up.sent) / up.size)}%` : '0%';
+  }
+
+  /** Re-mark the tiles on screen (upload progress) without laying anything out again. */
+  refreshMarks() {
+    for (const [i, el] of this.live) if (this.items[i]) this.mark(el, this.items[i]);
   }
 
   reveal() {

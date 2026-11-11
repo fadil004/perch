@@ -4,10 +4,11 @@ import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
 import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
 import { extractUrl, saveLink, recentLinks, siteOf } from './inbox.js';
-import { createUploader, stash } from './uploads.js';
+import { createUploader, stash, waiting } from './uploads.js';
+import { collectPending, notInLibrary } from './pending.js';
 import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError } from './bridge.js';
 import { createDrive, fetchBackend } from './drive.js';
-import { createMockDrive } from './mockdrive.js';
+import { createMockDrive, MOCK_CACHE } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
 import { setThumbSource, prefetch, thumbIdOf } from './thumbs.js';
 import { Grid } from './grid.js';
@@ -34,6 +35,8 @@ const S = {
   screen: '',
   authLost: false,
   swOk: false,
+  pending: [],             // videos sent from the phone that Eagle hasn't added yet (js/pending.js)
+  pendingStems: new Set(),
 };
 window.__perch = S; // handy for debugging in devtools
 const SHARE_KEY = 'perch.share';     // a link shared to Perch, kept until it's saved (survives a sign-in redirect)
@@ -77,7 +80,8 @@ grid.onColumns = (n, y) => setColumns(n, y);
 
 const media = {
   async src(fileId, { size = 0, onProgress } = {}) {
-    if (S.swOk && navigator.serviceWorker?.controller) return new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI).href;
+    if (fileId.startsWith('local:')) return localSrc(fileId.slice(6), size);
+    if (S.swOk && navigator.serviceWorker?.controller && !mockUpload(fileId)) return new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI).href;
     // Fallback: download the whole file with progress, then play from memory.
     const res = await S.drive.raw(fileId);
     const total = Number(res.headers.get('content-length')) || size || 0;
@@ -100,7 +104,7 @@ const media = {
    * to it starts at once. Skipped on Data Saver and very slow connections.
    */
   prefetch(fileId, size = 0) {
-    if (!S.swOk || !navigator.serviceWorker?.controller || !fileId) return;
+    if (!S.swOk || !navigator.serviceWorker?.controller || !fileId || fileId.startsWith('local:') || mockUpload(fileId)) return;
     if (size > 30 * 1024 * 1024) return;
     const c = navigator.connection;
     if (c && (c.saveData || /(^|-)2g$/.test(c.effectiveType || ''))) return;
@@ -109,7 +113,7 @@ const media = {
   lastError: () => (S.mode === 'drive' && !tokenValid() ? { name: 'AuthError' } : null),
   /** A video failed: was it the token? Asks the service worker's media route for one byte. */
   async authFailed(fileId) {
-    if (S.mode !== 'drive') return false;
+    if (S.mode !== 'drive' || fileId.startsWith('local:')) return false;
     if (!tokenValid()) return true;
     if (!S.swOk) return false;
     try {
@@ -119,6 +123,20 @@ const media = {
   },
   refreshing: () => !!S.redirecting,
 };
+
+/** A video uploaded in demo mode lives in the mock Drive, which the service worker can't see. */
+const mockUpload = (fileId) => !!(S.mock && S.mock.hasBytes && S.mock.hasBytes(fileId));
+
+/** A video sent to Eagle that's still on this phone (not uploaded yet): play the phone's own copy. */
+async function localSrc(stem, size) {
+  const w = (await waiting()).find((x) => x.id === stem);
+  if (w) return URL.createObjectURL(await w.blob());
+  // It finished uploading meanwhile: play it from Drive instead.
+  await refreshPending({ network: true });
+  const p = S.pending.find((it) => it.pending.stem === stem && !it.f.main.startsWith('local:'));
+  if (p) return media.src(p.f.main, { size });
+  throw new Error('This video is no longer on the phone');
+}
 
 const viewer = new Viewer({
   grid,
@@ -138,7 +156,10 @@ const viewer = new Viewer({
     return renewNow('401') ? 'redirect' : false;
   },
   onReconnect: () => reconnect(),
-  onClosed: () => { if (S.renewWhenIdle) { S.renewWhenIdle = false; renewSoon('idle'); } },
+  onClosed: () => {
+    if (S.renewWhenIdle) { S.renewWhenIdle = false; renewSoon('idle'); }
+    if (S.pendingDirty) { S.pendingDirty = false; showPending(); }
+  },
 });
 
 function openViewer(i, tile) {
@@ -293,7 +314,7 @@ async function forgetLibraries() {
   console.info('[perch] different Google account: clearing the cached library');
   try {
     for (const k of Object.keys(localStorage)) {
-      if (k === 'perch.lib.drive' || k === RESUME_KEY || k.startsWith('perch.view.drive.') || k.startsWith('perch.pasted.drive')) localStorage.removeItem(k);
+      if (k === 'perch.lib.drive' || k === RESUME_KEY || k.startsWith('perch.view.drive.') || k.startsWith('perch.pasted.drive') || k.startsWith('perch.inbox.') || k.startsWith('perch.pending.')) localStorage.removeItem(k);
     }
   } catch { /* storage unavailable */ }
   try { sessionStorage.removeItem('perch.unlocked'); } catch { /* ignore */ }
@@ -467,6 +488,7 @@ function showScreen(name) {
     requestAnimationFrame(() => { measureHero(); grid.measureTop(); grid.render(); onScroll(); });
     if (S.model) maybeShowInstallCard();
     setTimeout(handleSharedLink, 0);
+    setTimeout(() => { refreshPending({ network: false }); refreshPending(); }, 0);
   }
 }
 
@@ -592,6 +614,9 @@ const snapKey = (libId) => `snap:${S.modeKey}:${libId}`;
 
 async function openLibrary(lib) {
   S.lib = lib;
+  S.pending = [];
+  S.pendingSig = '';
+  S.pendingStems = new Set();
   lsSet(`perch.lib.${S.modeKey}`, lib);
   S.view = lsGet(`perch.view.${S.modeKey}.${lib.id}`, { type: 'all' });
   S.snap = null;
@@ -679,6 +704,7 @@ async function runSync({ first = false, full = false, background = false } = {})
       S.syncingLib = null;
       el.spin.hidden = true;
       endPull();
+      if (S.screen === 'main') refreshPending();
     }
   }
 }
@@ -729,7 +755,7 @@ function render({ reveal = false, keepScroll = false } = {}) {
   const m = S.model;
   if (!m) return;
   const searching = S.search.active;
-  S.list = searching ? m.search(m.visible, S.search.q, S.search.tags) : m.list(S.view);
+  S.list = searching ? m.search(m.visible, S.search.q, S.search.tags) : withPending(m.list(S.view));
   const title = m.viewName(S.view);
   el.libName.textContent = S.lib?.name || '';
   el.title.textContent = title;
@@ -983,6 +1009,76 @@ async function openLibrarySwitcher() {
   }
 }
 
+// ── videos on their way to Eagle ─────────────────────────────────────────────
+// What the phone sent (a phone download, a shared or picked video) shows in "All" like any other reference
+// right away, and plays from the phone's copy or from Drive, until Eagle on the computer has added it.
+
+/** "All" starts with them (they're the newest); never in folders or search, never next to the real item. */
+function withPending(list) {
+  if (S.view.type !== 'all' || !S.pending.length || !S.model) return list;
+  return [...notInLibrary(S.pending, S.model.items), ...list];
+}
+
+/**
+ * Look again at what was sent: what's still on the phone and what waits in the Drive inbox. On launch,
+ * resume, each sync and each finished upload. One at a time; a call meanwhile runs once more afterwards.
+ * `network: false` only looks at the phone (and the last Drive answer): instant, for a new file.
+ */
+function refreshPending({ network = true } = {}) {
+  if (!S.lib || !S.drive || S.redirecting) return Promise.resolve();
+  if (S.pendingP) { S.pendingAgain = S.pendingAgain || (network ? 'net' : 'local'); return S.pendingP; }
+  const lib = S.lib;
+  S.pendingP = (async () => {
+    const r = await collectPending({
+      drive: S.drive, modeKey: S.modeKey, libName: lib.name, uploads: uploader ? uploader.list() : [],
+      network: network && (S.mode === 'demo' || tokenValid()), token: S.mode === 'drive' ? token() : '',
+    });
+    if (S.lib !== lib) return;
+    // Eagle added one: bring the real item in (it takes the pending tile's place).
+    if (r.done.some((stem) => S.pendingStems.has(stem))) runSync({ background: true });
+    S.pendingStems = new Set(r.items.map((it) => it.pending.stem));
+    setPending(r.items);
+    if (await r.thumbs) S.pendingAgain = S.pendingAgain || 'local';   // Drive thumbnails arrived: show them
+  })().catch((e) => console.info('[perch] pending:', e.message)).finally(() => {
+    S.pendingP = null;
+    const again = S.pendingAgain;
+    S.pendingAgain = false;
+    if (again) refreshPending({ network: again === 'net' });
+  });
+  return S.pendingP;
+}
+
+function setPending(items) {
+  const sig = items.map((it) => [it.id, it.f.main, it.f.thumb, it.w, it.h, it.duration].join(':')).join('|');
+  if (sig === S.pendingSig) {
+    // Same tiles: only the status moved (an upload's progress, the info note).
+    const now = new Map(items.map((it) => [it.id, it]));
+    for (const it of S.pending) if (now.has(it.id)) it.pending = now.get(it.id).pending;
+    grid.refreshMarks();
+    return;
+  }
+  S.pending = items;
+  S.pendingSig = sig;
+  showPending();
+}
+
+function showPending() {
+  if (viewer.isOpen) { S.pendingDirty = true; return; }   // keep the viewer's swipe order; applied on close
+  if (S.screen === 'main' && S.model && !S.search.active && S.view.type === 'all') render({ keepScroll: true });
+}
+
+/** The upload queue moved: a new file on the phone shows at once; progress moves the tile's hairline. */
+function trackUploads(items) {
+  const ids = items.map((u) => u.id).join(',');
+  if (ids !== S.uploadIds) { S.uploadIds = ids; refreshPending({ network: false }); }
+  const byId = new Map(items.map((u) => [u.id, u]));
+  for (const it of S.pending) {
+    const u = byId.get(it.pending.stem);
+    if (u && it.pending.upload) it.pending.upload = u.status === 'uploading' ? { sent: u.sent || 0, size: u.size || it.size } : { sent: 0, size: it.size };
+  }
+  grid.refreshMarks();
+}
+
 // ── send to Eagle ────────────────────────────────────────────────────────────
 // Both ways go through the Drive inbox that Video Grabber (in Eagle on the computer) reads:
 // • a video the phone already has (shared from a downloader app such as YTDLnis, or picked here): Perch
@@ -997,8 +1093,8 @@ function up() {
   if (!uploader) {
     uploader = createUploader({
       ctx: () => ({ drive: S.drive, modeKey: S.modeKey, library: S.lib, writable: canSend() }),
-      onChange: (items) => { for (const fn of uploadListeners) fn(items); },
-      onSaved: (it) => { if (!S.shareOpen) toast('Sent to Eagle', it.name ? ` · ${it.name}` : ''); },
+      onChange: (items) => { for (const fn of uploadListeners) fn(items); trackUploads(items); },
+      onSaved: (it) => { if (!S.shareOpen) toast('Sent to Eagle', it.name ? ` · ${it.name}` : ''); refreshPending(); },
     });
     S.uploader = uploader;   // for devtools
   }
@@ -1072,8 +1168,11 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   let bridgeUp = false;
   const bridgeP = paired() ? ping() : Promise.resolve(null);
   bridgeP.then((info) => { if (!closed) { bridgeUp = !!info; linkMode(); } });
+  // The buttons wake up once there's something in the field: an empty field never says "not a link".
+  const empty = () => !input.value.trim();
   function linkMode() {
     saveBtn.textContent = bridgeUp ? 'Download' : writable ? 'Save link' : 'Allow & save';
+    saveBtn.disabled = pcBtn.disabled = empty();
     pcBtn.hidden = !bridgeUp;
     linkNote.textContent = bridgeUp ? 'Downloads on this phone, then Eagle adds it.' : 'Video Grabber downloads it when Eagle is open on your computer.';
   }
@@ -1136,7 +1235,7 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   }
   async function save(link = extractUrl(input.value), why = '') {
     err.textContent = '';
-    if (!link) { err.textContent = 'That doesn’t look like a link.'; return; }
+    if (!link) { if (!empty()) err.textContent = 'That doesn’t look like a link.'; return; }
     if (!writable) { askWriteFor(link); return; }
     saveBtn.disabled = pcBtn.disabled = true;
     saveBtn.textContent = 'Saving…';
@@ -1163,8 +1262,9 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   function download() {
     err.textContent = '';
     const link = extractUrl(input.value);
-    if (!link) { err.textContent = 'That doesn’t look like a link.'; return; }
+    if (!link) { if (!empty()) err.textContent = 'That doesn’t look like a link.'; return; }
     input.value = '';
+    linkMode();
     phoneCard({ url: link });
   }
   /** The phone couldn't (or the user chose the computer): save the link for Video Grabber instead. */
@@ -1172,6 +1272,7 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     if (canSend() || !why) { save(link, why); return; }
     // Saving for the computer needs Google's OK first: leave the link ready for one tap.
     input.value = link;
+    linkMode();
     err.textContent = why;
   }
   function phoneCard({ url: link, id = '' }) {
@@ -1282,8 +1383,8 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
       el.classList.remove('indet');
       head.textContent = 'Downloaded on this phone';
       title.textContent = j?.title || files[0].name;
-      const size = files.reduce((a, f) => a + f.size, 0);
-      show(files.length > 1 ? `${files.length} files · ${fmtBytes(size)}` : fmtBytes(size), 1, 'done');
+      // It's already a tile in "All" (js/pending.js), playing from this phone until Eagle has it.
+      show(`${files.length > 1 ? `${files.length} videos in` : 'In'} your library now · Eagle adds ${files.length > 1 ? 'them' : 'it'} on your computer`, 1, 'done');
       const f = files.find((x) => /^video\//.test(x.type)) || files[0];
       const src = URL.createObjectURL(f);
       blobUrls.push(src);
@@ -1312,11 +1413,12 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     } catch { /* the list is a nicety */ }
   }
 
-  const primary = () => (bridgeUp ? download() : save());
+  const primary = () => { if (!empty()) { if (bridgeUp) download(); else save(); } };
   saveBtn.addEventListener('click', primary);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') primary(); });
+  input.addEventListener('input', () => { err.textContent = ''; linkMode(); });
   const paste = navigator.clipboard && navigator.clipboard.readText
-    ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) input.value = u; else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
+    ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) { input.value = u; err.textContent = ''; linkMode(); } else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
     : null;
   const phone = h('div', { class: 'form' },
     upBtn, picker,
@@ -1345,7 +1447,7 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   up().refresh();
   if (paired()) for (const j of activeJobs()) phoneCard(j);   // downloads still going from before
   if (auto && url) {
-    if (paired() && !pc) { input.value = ''; phoneCard({ url }); }
+    if (paired() && !pc) { input.value = ''; linkMode(); phoneCard({ url }); }
     else if (writable) save(url);
   }
   if (S.drive) loadRecent();
@@ -1506,13 +1608,17 @@ async function doSignOut() {
   lsSet('perch.mode', null);
   lsSet('perch.lib.drive', null);
   lsSet('perch.pasted.drive', null);
+  lsSet('perch.pending.drive', null);
+  lsSet('perch.inbox.cache.drive', null);
   await swkv.del('auth');
   await wipeAll();
   location.replace(location.pathname);
 }
 
-function exitDemo() {
+async function exitDemo() {
   lsSet('perch.mode', null);
+  for (const k of ['perch.pending.', 'perch.inbox.', 'perch.inbox.cache.']) lsSet(k + S.modeKey, null);
+  try { await caches.delete(MOCK_CACHE); } catch { /* ignore */ }   // the demo inbox starts empty next time
   location.replace(location.pathname);
 }
 
@@ -1622,6 +1728,7 @@ addEventListener('online', () => { if (S.screen === 'main' && canSend()) up().re
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) onResume();
   if (!document.hidden && S.screen === 'main' && !S.redirecting && canSend()) up().run();   // uploads left from last time
+  if (!document.hidden && S.screen === 'main' && !S.redirecting) refreshPending();
   if (document.hidden || S.redirecting || S.screen !== 'main' || !S.snap) return;
   if (Date.now() - S.snap.lastSync > 5 * 60_000 && (S.mode === 'demo' || tokenValid())) runSync({ background: true });
 });
