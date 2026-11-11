@@ -1035,13 +1035,13 @@ function handleSharedLink() {
 }
 
 const LINK_STATUS = {
-  pending: 'Waiting for Eagle',
+  pending: 'Saved · Eagle on PC downloads it',
   queued: 'Downloading…',
   downloading: 'Downloading…',
   done: 'Added to Eagle',
   error: 'Couldn’t download',
 };
-const FILE_STATUS = { ...LINK_STATUS, queued: 'Adding to Eagle…', downloading: 'Adding to Eagle…', error: 'Couldn’t add' };
+const FILE_STATUS = { ...LINK_STATUS, pending: 'Uploaded · waiting for Eagle on PC', queued: 'Adding to Eagle…', downloading: 'Adding to Eagle…', error: 'Couldn’t add' };
 
 function openSaveLink({ url = '', auto = false } = {}) {
   const writable = canSend();
@@ -1135,7 +1135,7 @@ function openSaveLink({ url = '', auto = false } = {}) {
       if (!rows.length) { recent.replaceChildren(); return; }
       recent.replaceChildren(h('div', { class: 'group-label' }, 'Recent'), ...rows.map((r) => {
         const file = r.kind === 'file';
-        const status = (file ? FILE_STATUS : LINK_STATUS)[r.status] || 'Waiting for Eagle';
+        const status = (file ? FILE_STATUS : LINK_STATUS)[r.status || 'pending'] || (file ? FILE_STATUS : LINK_STATUS).pending;
         return h('div', { class: `link-row ${r.status || ''}` },
           h('span', { class: 'link-dot' }),
           h('div', { class: 'link-text' },

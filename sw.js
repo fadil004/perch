@@ -10,7 +10,7 @@
 // 4. Share target: a video shared from another app (POST ./share-target) is kept in the 'perch-share' cache
 //    and the app opens to upload it to Drive; a shared link goes on to the app as ?share_url=….
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v9';
+const VERSION = 'perch-v10';
 const MEDIA_CACHE = 'perch-media';
 const MEDIA_MAX_FILE = 30 * 1024 * 1024;
 const MEDIA_BUDGET = 600 * 1024 * 1024;
