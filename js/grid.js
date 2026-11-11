@@ -323,6 +323,6 @@ function badgeHtml(it) {
     const dur = it.duration ? `<span>${fmtDuration(it.duration)}</span>` : '';
     return (it.medium && it.videoID ? I.play : I.link) + dur;
   }
-  if (it.kind === 'file') return it.ext ? it.ext.toUpperCase().slice(0, 5) : '';
+  if (it.kind === 'file') return it.ext ? it.ext.toUpperCase().slice(0, 5).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`) : '';
   return '';
 }

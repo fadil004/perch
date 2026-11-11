@@ -206,14 +206,17 @@ async function startDrive(red) {
   setThumbSource(S.drive);
   if (tokenValid()) {
     await swkv.set('auth', getAuth());
-    // Learn which account this is, so renewals can name it (login_hint).
-    if ((red && red.ok) || !getAuth().email) S.drive.about().then(rememberAccount).catch(() => {});
     // Close to expiry at launch: renew now rather than in the middle of a video (never right after a renew).
     if (!red && renewNow('start')) return;
-    return afterConnect();
+    // Which account is this? Settled before anything cached is shown (and remembered for login_hint).
+    await checkAccount(red);
+    if (S.redirecting) return;
+    if (tokenValid()) return afterConnect();
+    // Google rejected the token during the check: carry on as for an expired one.
   }
   // Expired: a silent round trip to Google usually returns a fresh token instantly.
   if (!red && renewNow('start')) return;
+  if (red && red.ok) await checkAccount(red);   // a token that arrived nearly expired: still never show another account's cache
   const saved = lsGet('perch.lib.drive');
   const snap = saved ? await kv.get(snapKey(saved.id)).catch(() => null) : null;
   if (saved && snap) {
@@ -225,6 +228,46 @@ async function startDrive(red) {
     return;
   }
   showOnboarding();
+}
+
+/**
+ * The token may belong to another Google account than the cached library (Reconnect, then a different
+ * account picked on Google's page). Never show one account's cache to another: compare the account with
+ * the one the cache was made with and wipe the cache when it differs or can't be confirmed.
+ */
+async function checkAccount(red) {
+  const fresh = !!(red && red.ok);
+  const prev = lsGet('perch.account');
+  if (!fresh && prev && getAuth()?.email === prev) return;   // this token was checked when it arrived
+  const saved = lsGet('perch.lib.drive');
+  let email = '';
+  try { email = await S.drive.about(); } catch { /* offline or rejected: decided below */ }
+  let wipe = false;
+  if (!email) wipe = fresh && !!(prev || saved);              // a new sign-in we can't identify: don't risk it
+  else if (prev) wipe = prev !== email;
+  else if (saved) wipe = !(await canRead(saved.id));          // cache from before accounts were remembered
+  if (wipe) await forgetLibraries();
+  if (email) rememberAccount(email);
+}
+
+async function canRead(folderId) {
+  try { await S.drive.get(folderId, 'id'); return true; } catch { return false; }
+}
+
+/** Drop everything cached from the Drive account that was signed in before. */
+async function forgetLibraries() {
+  console.info('[perch] different Google account: clearing the cached library');
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k === 'perch.lib.drive' || k === RESUME_KEY || k.startsWith('perch.view.drive.') || k.startsWith('perch.pasted.drive')) localStorage.removeItem(k);
+    }
+  } catch { /* storage unavailable */ }
+  try { sessionStorage.removeItem('perch.unlocked'); } catch { /* ignore */ }
+  S.unlocked = new Set();
+  S.libs = [];
+  await wipeAll();                      // IndexedDB (libraries, thumbnails) and the service worker's store
+  await swkv.set('mode', { mode: 'drive' });
+  await swkv.set('auth', getAuth());
 }
 
 // ── token renewal ────────────────────────────────────────────────────────────
@@ -396,7 +439,7 @@ async function showLibraries() {
   el.libList.replaceChildren();
   el.libsSub.textContent = 'Looking for Eagle libraries…';
   try {
-    S.libs = await discoverLibraries(S.drive);
+    S.libs = withPasted(await discoverLibraries(S.drive));
   } catch (e) {
     return handleFatal(e);
   }
@@ -426,6 +469,7 @@ function openPasteLink() {
     err.textContent = '';
     try {
       const libs = await resolveFolderLink(S.drive, input.value);
+      rememberPasted(libs);
       for (const l of libs) if (!S.libs.some((x) => x.id === l.id)) S.libs.push(l);
       await closeSheet();
       if (libs.length === 1) openLibrary(libs[0]);
@@ -441,6 +485,19 @@ function openPasteLink() {
     body: h('div', { class: 'form' }, input, err, h('button', { class: 'btn-primary', type: 'button', onclick: go }, 'Open')),
   });
   setTimeout(() => input.focus(), 350);
+}
+
+// Libraries opened from a pasted link (often shared with you, so discovery can't find them) are remembered.
+const pastedKey = () => `perch.pasted.${S.modeKey}`;
+function rememberPasted(libs) {
+  const list = lsGet(pastedKey(), []);
+  for (const l of libs) if (!list.some((x) => x.id === l.id)) list.push({ id: l.id, name: l.name, modifiedTime: l.modifiedTime });
+  lsSet(pastedKey(), list);
+}
+function withPasted(libs) {
+  const out = [...libs];
+  for (const l of lsGet(pastedKey(), [])) if (l && l.id && !out.some((x) => x.id === l.id)) out.push(l);
+  return out;
 }
 
 const snapKey = (libId) => `snap:${S.modeKey}:${libId}`;
@@ -489,14 +546,20 @@ function firstSyncProgress(p) {
   }
 }
 
+// A sync belongs to one library. Opening another library while it runs starts that library's own sync;
+// the older one finishes quietly and only the newest sync owns the flags.
+let syncGen = 0;
 async function runSync({ first = false, full = false, background = false } = {}) {
-  if (S.syncing || !S.lib) return;
+  if (!S.lib || (S.syncing && S.syncingLib && S.syncingLib.id === S.lib.id)) return;
+  const gen = ++syncGen;
   S.syncing = true;
   const lib = S.lib;
+  S.syncingLib = lib;
+  const current = () => S.lib && S.lib.id === lib.id;
   if (!first) el.spin.hidden = false;
   try {
-    const { snap, stats } = await syncLibrary(S.drive, lib, full ? null : S.snap, { full, onProgress: first ? firstSyncProgress : () => {} });
-    if (S.lib !== lib) return;
+    const { snap, stats } = await syncLibrary(S.drive, lib, full ? null : S.snap, { full, onProgress: first ? (p) => { if (current()) firstSyncProgress(p); } : () => {} });
+    if (!current()) return;
     console.info('[perch] sync', stats);
     S.lastStats = stats;
     await kv.set(snapKey(lib.id), snap).catch((e) => console.warn('[perch] could not cache library', e));
@@ -509,17 +572,22 @@ async function runSync({ first = false, full = false, background = false } = {})
     } else {
       S.snap = snap;
     }
-    setNotice(null);
+    const n = stats.failed || 0;
+    if (n) setNotice(`${n.toLocaleString('en')} ${n === 1 ? 'reference' : 'references'} couldn’t be read · Retry`, () => runSync());
+    else setNotice(null);
   } catch (e) {
-    if (S.lib !== lib) return;
+    if (!current()) return;
     if (e.name === 'AuthError') { onAuthExpired(); if (first && !S.redirecting) showOnboarding(); return; }
     console.warn('[perch] sync failed', e);
     if (first) showSyncError(e);
     else setNotice(navigator.onLine ? 'Couldn’t sync · Retry' : 'Offline · saved library', () => runSync());
   } finally {
-    S.syncing = false;
-    el.spin.hidden = true;
-    endPull();
+    if (gen === syncGen) {
+      S.syncing = false;
+      S.syncingLib = null;
+      el.spin.hidden = true;
+      endPull();
+    }
   }
 }
 
@@ -813,7 +881,7 @@ async function openLibrarySwitcher() {
   ];
   const sheet = openSheet({ title: 'Libraries', body: S.libs.length ? body() : h('div', { class: 'group-label' }, 'Looking for libraries…') });
   if (!S.libs.length) {
-    try { S.libs = await discoverLibraries(S.drive); sheet.setBody(body()); } catch (e) { sheet.setBody(h('div', { class: 'group-label' }, e.message)); }
+    try { S.libs = withPasted(await discoverLibraries(S.drive)); sheet.setBody(body()); } catch (e) { sheet.setBody(h('div', { class: 'group-label' }, e.message)); }
   }
 }
 
@@ -829,6 +897,7 @@ async function doSignOut() {
   signOut();
   lsSet('perch.mode', null);
   lsSet('perch.lib.drive', null);
+  lsSet('perch.pasted.drive', null);
   await swkv.del('auth');
   await wipeAll();
   location.replace(location.pathname);

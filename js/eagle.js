@@ -1,11 +1,12 @@
 // Eagle 4 library on Drive: discovery, sync (first + incremental) and the in-memory model.
 import { FOLDER } from './drive.js';
-import { pool } from './util.js';
+import { pool, safeUrl } from './util.js';
 
 const VIDEO = new Set(['mp4', 'mov', 'webm', 'm4v']);
 const IMAGE = new Set(['jpg', 'jpeg', 'png', 'webp', 'svg', 'avif', 'bmp', 'ico']);
 const ANIM = new Set(['gif']);
 const SNAPSHOT_VERSION = 3; // v3: thumbnail versions (thumbV/mainV) in item.f
+const MAX_NET_FAILS = 8;    // network failures in a row (each already retried) before a sync gives up
 
 export const libName = (folderName) => String(folderName || '').replace(/\.library$/i, '');
 
@@ -16,11 +17,13 @@ export async function discoverLibraries(drive) {
     .filter((f) => /\.library$/i.test(f.name))
     .map((f) => ({ id: f.id, name: libName(f.name), modifiedTime: f.modifiedTime }));
   const fields = 'id,name,modifiedTime,parents';
-  let libs = pick(await drive.list(`mimeType='${FOLDER}' and name contains 'library' and trashed=false`, fields));
-  if (!libs.length) {
-    // Drive's `contains` is token-prefix based; fall back to scanning folder names.
-    libs = pick(await drive.list(`mimeType='${FOLDER}' and trashed=false and not name contains '.info'`, fields));
-  }
+  // Drive's `contains` is token based, so the name query alone can miss libraries, or match only one
+  // oddly named one ("Work library.library"). Always merge it with a scan of folder names.
+  const [named, scanned] = await Promise.all([
+    drive.list(`mimeType='${FOLDER}' and name contains 'library' and trashed=false`, fields),
+    drive.list(`mimeType='${FOLDER}' and trashed=false and not name contains '.info'`, fields),
+  ]);
+  const libs = pick([...named, ...scanned]);
   const seen = new Set();
   return libs.filter((l) => !seen.has(l.id) && seen.add(l.id)).sort((a, b) => a.name.localeCompare(b.name));
 }
@@ -125,11 +128,13 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
   const imagesF = root.find((f) => f.name === 'images' && f.mimeType === FOLDER);
   if (!metaF || !imagesF) throw new Error('This folder isn’t an Eagle library.');
 
+  // Bad JSON is tolerated; a file that couldn't be fetched fails the sync (so nothing stale is saved as current).
+  const parsed = (fallback) => (e) => { if (e instanceof SyntaxError) return fallback; throw e; };
   const [tree, tags, mtimeRaw] = await Promise.all([
     reuse && reuse.metaModified === metaF.modifiedTime ? reuse.tree : drive.json(metaF.id).then((j) => (Array.isArray(j.folders) ? j.folders : [])),
     !tagsF ? { historyTags: [], starredTags: [] }
-      : reuse && reuse.tagsModified === tagsF.modifiedTime ? reuse.tags : drive.json(tagsF.id).catch(() => ({ historyTags: [], starredTags: [] })),
-    mtimeF ? drive.json(mtimeF.id).catch(() => null) : null,
+      : reuse && reuse.tagsModified === tagsF.modifiedTime ? reuse.tags : drive.json(tagsF.id).catch(parsed({ historyTags: [], starredTags: [] })),
+    mtimeF ? drive.json(mtimeF.id).catch(parsed(null)) : null,
   ]);
 
   let mtimes = null;
@@ -174,14 +179,19 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
   const { children, size: chunk } = await listChildren(drive, need.map((id) => infoMap[id]), reuse?.chunk || 40,
     (d, t) => onProgress({ phase: 'scan', done: d, total: t }));
 
-  let done = 0, fetched = 0;
+  // A reference whose metadata couldn't be fetched is counted and left as it was (absent, or its old
+  // version), so the next sync tries it again. Many network failures in a row end the sync instead of
+  // grinding through the rest.
+  let done = 0, fetched = 0, failed = 0, netFails = 0, abort = null;
   const limit = pool(10);
   await Promise.all(need.map((id) => limit(async () => {
+    if (abort) return;
     const files = children.get(infoMap[id]) || [];
     const metaFile = files.find((f) => f.name === 'metadata.json');
     try {
       if (!metaFile) { skipped[id] = stamp(id); items.delete(id); return; }
       const raw = await drive.json(metaFile.id);
+      netFails = 0;
       fetched++;
       if (raw.isDeleted || !raw.id) { skipped[id] = stamp(id); items.delete(id); return; }
       const it = normalizeItem(raw, files, infoMap[id]);
@@ -191,11 +201,16 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
       delete skipped[id];
     } catch (e) {
       if (e.name === 'AuthError') throw e;
+      if (e.name === 'DriveError') {
+        failed++;
+        if (e.status === 0 && ++netFails >= MAX_NET_FAILS) abort = abort || e;
+      }
       console.warn('[perch] skipped item', id, e.message);
     } finally {
       onProgress({ phase: 'meta', done: ++done, total });
     }
   })));
+  if (abort) throw abort;
 
   const snap = {
     v: SNAPSHOT_VERSION,
@@ -216,6 +231,7 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
     mode: reuse ? 'incremental' : 'full',
     items: snap.items.length,
     fetched,
+    failed,
     removed,
     skipped: Object.keys(skipped).length,
     chunk,
@@ -325,8 +341,8 @@ export class Library {
 
 export function embedFor(it) {
   let medium = it.medium, vid = it.videoID;
-  if (!vid && it.url) {
-    const u = it.url;
+  if (!vid && safeUrl(it.url)) {
+    const u = safeUrl(it.url);
     let m;
     if ((m = /(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/)|youtu\.be\/)([\w-]{6,})/.exec(u))) { medium = 'youtube'; vid = m[1]; }
     else if ((m = /vimeo\.com\/(?:video\/)?(\d{5,})/.exec(u))) { medium = 'vimeo'; vid = m[1]; }

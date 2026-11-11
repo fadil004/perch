@@ -13,6 +13,7 @@ const AUTH_KEY = 'perch.auth';
 const STATE_KEY = 'perch.oauth.state';
 const SILENT_KEY = 'perch.oauth.silent';
 const ACCOUNT_KEY = 'perch.account';      // email of the Drive account; outlives any single token
+const NEEDS_USER_KEY = 'perch.oauth.needsUser'; // set when Google said a silent renew needs the user
 const STATE_TTL = 10 * 60_000;
 const SILENT_GAP = 2 * 60_000;            // at most one silent attempt per 2 minutes (no redirect loops)
 export const RENEW_AHEAD = 10 * 60_000;   // renew when less than this is left
@@ -69,6 +70,7 @@ export function signIn({ silent = false } = {}) {
 /** Silent renew is possible: configured, online, signed in before, and no attempt in the last 2 minutes. */
 export function canTrySilent() {
   if (!hasClientId() || !navigator.onLine || !(getAuth() || accountHint())) return false;
+  if (lsGet(NEEDS_USER_KEY)) return false;   // it would only fail again: wait for the user to tap Reconnect
   const last = Number(lsGet(SILENT_KEY, 0)) || 0;
   return Date.now() - last > SILENT_GAP;
 }
@@ -85,7 +87,11 @@ export function consumeRedirect() {
   lsSet(STATE_KEY, null);
   if (!saved || typeof saved.t !== 'number' || Date.now() - saved.t > STATE_TTL) return { error: 'state_expired' };
   if (saved.state !== p.get('state')) return { error: 'state_mismatch' };
-  if (p.has('error')) return { error: p.get('error'), silent: !!saved.silent };
+  if (p.has('error')) {
+    if (saved.silent && NEEDS_USER.has(p.get('error'))) lsSet(NEEDS_USER_KEY, true);
+    return { error: p.get('error'), silent: !!saved.silent };
+  }
+  lsSet(NEEDS_USER_KEY, null);
   const auth = {
     token: p.get('access_token'),
     exp: Date.now() + (Number(p.get('expires_in')) || 3600) * 1000,
@@ -104,6 +110,7 @@ export function signOut() {
   const a = getAuth();
   lsSet(AUTH_KEY, null);
   lsSet(ACCOUNT_KEY, null);
+  lsSet(NEEDS_USER_KEY, null);
   if (a?.token) {
     fetch(REVOKE_URL, {
       method: 'POST',

@@ -3,8 +3,11 @@
 import { thumbStore } from './store.js';
 
 let drive = null;
-const mem = new Map();       // fileId -> object URL
+const mem = new Map();       // fileId -> object URL, least recently used first
 const inflight = new Map();  // fileId -> Promise<url|null>
+const warming = new Map();   // fileId -> Promise (background download into IndexedDB only)
+const MAX_URLS = 600;        // object URLs kept alive; older ones are released
+const WARM_URLS = 400;       // the background warm-up keeps URLs only up to here, beyond it just the offline copy
 const waiting = new Map();   // fileId -> queued job (not started yet)
 const high = [];             // LIFO: most recently requested (visible) first
 const low = [];              // FIFO: background warm-up
@@ -21,7 +24,22 @@ export function setThumbSource(d) {
   waiting.clear();
 }
 
-export const cachedThumb = (id) => (id ? mem.get(id) || null : null);
+export function cachedThumb(id) {
+  const url = id ? mem.get(id) : null;
+  if (!url) return null;
+  mem.delete(id);
+  mem.set(id, url);          // most recently used
+  return url;
+}
+
+function remember(id, url) {
+  mem.set(id, url);
+  while (mem.size > MAX_URLS) {
+    const [oldId, oldUrl] = mem.entries().next().value;
+    mem.delete(oldId);
+    setTimeout(() => URL.revokeObjectURL(oldUrl), 30_000);   // an <img> may still be about to read it
+  }
+}
 
 function pump() {
   while (active < LIMIT && (high.length || low.length)) {
@@ -55,8 +73,9 @@ function promote(id) {
 /** `id` is a cache key: "<driveFileId>|<version>" (or a bare file id). */
 export function loadThumb(id, lane = 'high') {
   if (!id) return Promise.resolve(null);
-  if (mem.has(id)) return Promise.resolve(mem.get(id));
+  if (mem.has(id)) return Promise.resolve(cachedThumb(id));
   if (inflight.has(id)) { if (lane === 'high') promote(id); return inflight.get(id); }
+  if (warming.has(id)) { if (lane === 'high') promote(id); return warming.get(id).then(() => loadThumb(id, lane)); }
   const p = (async () => {
     let blob = null;
     try { blob = await thumbStore.get(id); } catch { /* storage unavailable */ }
@@ -69,7 +88,7 @@ export function loadThumb(id, lane = 'high') {
       thumbStore.put(id, blob).catch(() => {});
     }
     const url = URL.createObjectURL(blob);
-    mem.set(id, url);
+    remember(id, url);
     return url;
   })().catch(() => null).finally(() => inflight.delete(id));
   inflight.set(id, p);
@@ -86,11 +105,25 @@ export function prefetch(ids) {
     if (gen !== generation) return;
     const batch = ids.slice(i, i + 24);
     i += 24;
-    Promise.all(batch.map((id) => (mem.has(id) ? null : loadThumb(id, 'low')))).then(() => {
+    Promise.all(batch.map((id) => (mem.has(id) ? null : mem.size < WARM_URLS ? loadThumb(id, 'low') : warm(id)))).then(() => {
       if (i < ids.length) idle(step);
     });
   };
   setTimeout(step, 1500);
+}
+
+/** Make sure the offline copy exists, without holding the image in memory. */
+function warm(id) {
+  if (!id || inflight.has(id) || warming.has(id)) return null;
+  const p = (async () => {
+    try { if (await thumbStore.has(id)) return; } catch { return; }
+    if (!drive) return;
+    const source = drive;
+    const blob = await enqueue(id, () => source.blob(id.split('|')[0]), 'low');
+    if (blob) await thumbStore.put(id, blob).catch(() => {});
+  })().catch(() => {}).finally(() => warming.delete(id));
+  warming.set(id, p);
+  return p;
 }
 
 const versioned = (id, v) => (v ? `${id}|${v}` : id);

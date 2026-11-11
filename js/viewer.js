@@ -1,6 +1,6 @@
 // Fullscreen viewer: shared-element open/close, 1:1 paging and dismiss with velocity handoff,
 // pinch/double-tap zoom, inline video with a minimal scrubber, link embeds and an info sheet.
-import { h, clamp, lerp, spring, rubberband, project, Velocity, liveTransform, fmtDuration, fmtBytes, fmtDate, rgb, hex, reducedMotion, lsGet, lsSet, safeTop } from './util.js';
+import { h, clamp, lerp, spring, rubberband, project, Velocity, liveTransform, fmtDuration, fmtBytes, fmtDate, rgb, hex, reducedMotion, lsGet, lsSet, safeTop, safeUrl } from './util.js';
 import { I } from './icons.js';
 import { cachedThumb, loadThumb, thumbIdOf } from './thumbs.js';
 import { embedFor, hostOf } from './eagle.js';
@@ -532,6 +532,9 @@ export class Viewer {
     this.positionSlot(this.slots[2], 1);
     this.setTrack(this.trackX + dir * (this.VW + GAP));
     if (Math.abs(this.trackX) < 0.5) this.setTrack(0);
+    // Paged onto a portrait item while rotated: it reads best upright.
+    const next = this.cur.item;
+    if ((this.rot || this.rotTry) && next && next.h > next.w) this.exitRotation();
     // Old current becomes a neighbour: stop its media but keep the thumbnail.
     this.dropStepper(old);
     if (old.video) { old.video.pause(); old.video.removeAttribute('src'); old.video.load(); old.video.remove(); old.video = null; }
@@ -583,8 +586,8 @@ export class Viewer {
       this.bottom.append(this.vc.root, this.fs.root);
       this.vcReset(it);
       this.fsSync();
-    } else if (it.kind === 'link' && it.url) {
-      this.bottom.append(h('a', { class: 'v-open', href: it.url, target: '_blank', rel: 'noopener noreferrer' }, h('span', { html: I.external, style: { display: 'contents' } }), h('span', null, hostOf(it.url) || 'Open link')));
+    } else if (it.kind === 'link' && safeUrl(it.url)) {
+      this.bottom.append(h('a', { class: 'v-open', href: safeUrl(it.url), target: '_blank', rel: 'noopener noreferrer' }, h('span', { html: I.external, style: { display: 'contents' } }), h('span', null, hostOf(it.url) || 'Open link')));
     } else if (it.kind === 'file' && it.f.main && this.canOpenDrive()) {
       this.bottom.append(h('a', { class: 'v-open', href: `https://drive.google.com/file/d/${encodeURIComponent(it.f.main)}/view`, target: '_blank', rel: 'noopener noreferrer' }, h('span', { html: I.drive, style: { display: 'contents' } }), h('span', null, 'Open in Drive')));
     }
@@ -830,7 +833,12 @@ export class Viewer {
       }, h('span', { class: 'dot', style: { background: FOLDER_COLORS[f.color] || '#5b5b60' } }), h('span', { dir: 'auto' }, f.name))))));
     }
     if (it.url) {
-      kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Source'), h('a', { class: 'i-link', href: it.url, target: '_blank', rel: 'noopener noreferrer' }, h('span', { dir: 'auto' }, it.url.replace(/^https?:\/\/(www\.)?/, '')), h('i', { html: I.external, style: { display: 'contents' } }))));
+      // Only http(s) becomes a link; anything else (javascript:, data:, …) is shown as plain text.
+      const href = safeUrl(it.url);
+      const text = h('span', { dir: 'auto' }, it.url.replace(/^https?:\/\/(www\.)?/, ''));
+      kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Source'), href
+        ? h('a', { class: 'i-link', href, target: '_blank', rel: 'noopener noreferrer' }, text, h('i', { html: I.external, style: { display: 'contents' } }))
+        : h('div', { class: 'i-link' }, text)));
     }
     if (it.note) kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Notes'), h('div', { class: 'i-note', dir: 'auto' }, it.note)));
     if (it.btime) kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Added'), h('div', { class: 'i-date' }, fmtDate(it.btime))));

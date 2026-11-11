@@ -22,6 +22,15 @@ export function h(tag, attrs, ...kids) {
 }
 
 export const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+/** A URL from library metadata, only if it is http(s); '' otherwise (no javascript:, data:, …). */
+export function safeUrl(u) {
+  if (typeof u !== 'string' || !u.trim()) return '';
+  try {
+    const url = new URL(u.trim());
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : '';
+  } catch { return ''; }
+}
 export const lerp = (a, b, t) => a + (b - a) * t;
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
