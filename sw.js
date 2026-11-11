@@ -4,7 +4,7 @@
 // 2. Streams Drive media: ./media/<fileId> → Drive alt=media with the OAuth token and the Range header,
 //    so <video> can seek without downloading whole files.
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v6';
+const VERSION = 'perch-v7';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './config.js', './css/app.css',
   './js/main.js', './js/util.js', './js/icons.js', './js/store.js', './js/auth.js', './js/drive.js',

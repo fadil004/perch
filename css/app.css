@@ -312,6 +312,7 @@ h1, h2, p { margin: 0; }
   margin: 0 calc(var(--pad) + var(--sar)) 0 calc(var(--pad) + var(--sal));
   touch-action: pan-y;
   min-height: 1px;
+  overflow-x: clip;   /* tiles still placed for a wider screen must not widen the page (Android zooms out for it) */
 }
 .tile {
   position: absolute;

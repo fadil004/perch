@@ -85,6 +85,17 @@ export class Viewer {
       if (this.rot === 'css') this.sizeRotated();
       if (this.isOpen) { this.relayout(); this.updateRotateBtn(); }
     });
+    // The viewer box can settle after the last window resize (leaving a fullscreen landscape lock on Android
+    // does exactly that), so also lay out again whenever the box itself changes and the layout no longer fits.
+    new ResizeObserver(() => {
+      if (!this.isOpen || this.closing) return;
+      const s = this.cur, r = s && s.fitRect;
+      if (!s || !s.item || !r) return;
+      const f = this.fit(s.item);
+      if (Math.abs(f.left - r.left) < 0.5 && Math.abs(f.top - r.top) < 0.5 && Math.abs(f.width - r.width) < 0.5 && Math.abs(f.height - r.height) < 0.5) return;
+      this.relayout();
+      this.updateRotateBtn();
+    }).observe(this.root);
     addEventListener('keydown', (e) => {
       if (!this.isOpen) return;
       if (e.key === 'Escape') { e.preventDefault(); this.infoQ > 0.5 ? this.setInfo(false) : this.close(); }
@@ -98,9 +109,11 @@ export class Viewer {
 
   get cur() { return this.slots[1]; }
 
-  // The stage's own frame: in the CSS-rotated fallback its width is the screen height and vice versa.
-  get VW() { return this.rot === 'css' ? innerHeight : innerWidth; }
-  get VH() { return this.rot === 'css' ? innerWidth : innerHeight; }
+  // The stage's own frame, measured from the viewer box itself. innerWidth/innerHeight are not trusted: while
+  // Android turns back from a fullscreen landscape lock they briefly report a passing, zoomed-out viewport.
+  // In the CSS-rotated fallback the box is turned sideways, so its width is the screen height and vice versa.
+  get VW() { return this.root.clientWidth || (this.rot === 'css' ? innerHeight : innerWidth); }
+  get VH() { return this.root.clientHeight || (this.rot === 'css' ? innerWidth : innerHeight); }
   px(e) { return this.rot === 'css' ? e.clientY : e.clientX; }
   py(e) { return this.rot === 'css' ? innerWidth - e.clientX : e.clientY; }
   satPx() { return this.satProbe.offsetHeight; }
