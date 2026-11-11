@@ -1059,3 +1059,32 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .up-bar i { display: block; height: 100%; background: #0a84ff; border-radius: 2px; transition: width 200ms linear; }
 .link-retry { flex: none; height: 32px; padding: 0 14px; border-radius: 999px; background: var(--fill); color: var(--t1); font-size: 14px; font-weight: 600; }
 .up-note { padding: 2px 12px 4px; }
+
+/* Save to Eagle: links downloaded on the phone (phone downloader) */
+.dl-card { margin: 0 12px 6px; padding: 12px 14px; border-radius: 14px; background: var(--fill); }
+.dl-card .link-meta { font-variant-numeric: tabular-nums; }
+.dl-card .up-bar { background: rgba(255, 255, 255, .1); }
+.dl.indet .up-bar i { width: 30%; animation: indet 1.1s var(--ease-ui) infinite; }
+.dl[data-state="done"] .up-bar { display: none; }
+.dl[data-state="error"] .up-bar { display: none; }
+.dl[data-state="error"] .link-meta { color: #ff6961; white-space: normal; }
+.dl-media { margin-top: 10px; border-radius: 10px; overflow: hidden; background: #000; }
+.dl-media video, .dl-media img { display: block; width: 100%; max-height: 52vh; object-fit: contain; background: #000; }
+.dl-alt { display: block; margin: 8px 0 -4px; height: 32px; font-size: 14px; font-weight: 500; color: var(--t2); }
+.dl-alt:active { opacity: .5; }
+.form .dl-pc { height: 40px; font-size: 15px; margin-top: -4px; }
+
+/* Phone downloader sheet */
+.dl-status { display: flex; gap: 12px; align-items: flex-start; margin: 2px 12px 8px; padding: 14px; border-radius: 14px; background: var(--fill); }
+.dl-status .link-dot { margin-top: 6px; }
+.dl-status.on .link-dot { background: #30d158; }
+.dl-status.error .link-dot { background: #ff9f0a; }
+.dl-status .link-title { font-weight: 600; }
+.dl-status .link-meta { white-space: normal; margin-top: 3px; line-height: 1.4; }
+.dl-note { padding: 6px 14px 4px; }
+.step-t a { color: #0a84ff; text-decoration: none; }
+.cmd { display: flex; align-items: center; gap: 8px; margin: 8px 0 2px; padding: 8px 8px 8px 12px; border-radius: 12px; background: var(--fill); }
+.cmd code { flex: 1; min-width: 0; font: 500 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1); word-break: break-all; -webkit-user-select: all; user-select: all; }
+.cmd-copy { flex: none; height: 34px; padding: 0 12px; border-radius: 999px; background: var(--fill-2); font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.cmd-copy .ico, .cmd-copy .ico svg { width: 16px; height: 16px; }
+.cmd-copy:active { opacity: .6; }

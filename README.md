@@ -123,6 +123,17 @@ Notes:
 - Shared files wait in the `perch-share` cache until they are in Drive, so nothing is lost if Perch closes mid-upload. Uploads only run while Perch is open.
 - The share-sheet entry needs the app installed from Chrome (Android). After an update that changes it, removing and re-adding the app applies it at once (Chrome otherwise updates it within about a day).
 
+## Phone downloader (Termux)
+
+So one share is enough on Android: share a video link to Perch, the phone downloads it, you can watch it right away, and it goes to Drive and then into Eagle when the computer is on. A web page can't fetch videos from Instagram, TikTok or YouTube itself, so the download runs in **Termux** (a free Linux terminal app) with **yt-dlp** — the same downloader Video Grabber uses on the computer.
+
+- `bridge/perch-bridge.py`: yt-dlp behind a tiny HTTP server on `127.0.0.1:47821`, usable only by Perch (origin check + a pairing token). API in `bridge/API.md`.
+- `bridge/install.sh`: one command in Termux — `curl -fsSL https://fadil004.github.io/perch/bridge/install.sh | bash`. Installs Python, ffmpeg, Node (YouTube needs a JavaScript runtime) and yt-dlp, starts the downloader whenever Termux opens (and at boot with Termux:Boot), and opens Perch once to pair. Run it again (or `perch-update`) to update; yt-dlp also updates itself daily.
+- Helper commands in Termux: `perch-start`, `perch-stop`, `perch-pair`, `perch-log`, `perch-update`.
+- Chrome asks once to let Perch reach apps on the phone; allow it. Set Termux's battery use to Unrestricted so Android doesn't stop it.
+- Signed-in posts (some Instagram, X, Facebook): add a cookies.txt in **Phone downloader → Add cookies file**. Cookies stay on the phone (`~/.perch/cookies.txt`).
+- If the downloader is off or a download fails, Perch saves the link for the computer instead (Video Grabber downloads it when Eagle is open).
+
 ## Privacy and limits
 
 - **Access:**

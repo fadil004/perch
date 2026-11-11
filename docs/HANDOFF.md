@@ -53,6 +53,23 @@ itself (CORS, and those sites need yt-dlp), so the phone downloads with an Andro
 - Tested: headless Brave (share POST, picker, reload mid-upload, dropped connection against a fake
   Google endpoint) and a Node test of the plugin. **Not yet on the real phone, real Drive, or real Eagle.**
 
+## v10 — phone downloader (Termux bridge)
+
+The user wants one share → download on the phone → watch → Drive → Eagle, free, most sites.
+A web page can't fetch from Instagram/TikTok/YouTube (CORS), so yt-dlp runs in Termux:
+- `bridge/perch-bridge.py` (stdlib-only Python + yt-dlp): HTTP API on `127.0.0.1:47821`, contract in
+  `bridge/API.md`. Origin allow-list + pairing token (`~/.perch/token`, handed to Perch via
+  `#bridge=<token>`). Jobs, progress, Range file serving, cookies (`~/.perch/cookies.txt`, phone only),
+  retry with/without cookies, daily `pip install -U yt-dlp yt-dlp-ejs` + re-exec when idle.
+  Node is used as yt-dlp's JavaScript runtime (YouTube needs one since yt-dlp 2025.11).
+- `bridge/install.sh`: `curl -fsSL https://fadil004.github.io/perch/bridge/install.sh | bash` in Termux.
+  Helpers `perch-start|stop|pair|log|update`; starts from `~/.bashrc` and `~/.termux/boot/`.
+  Tested only in a simulated Termux on macOS (stub `pkg`, real Python/yt-dlp), not on a phone.
+- Chrome's Local Network Access asks once to let the site reach loopback; verified from the live
+  https origin in headless Brave that requests work once the permission is granted (and fail before).
+- Cookies are deliberately NOT synced through Drive (login cookies shouldn't sit in cloud storage);
+  the user adds a cookies.txt on the phone (Perch → Phone downloader → Add cookies file).
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

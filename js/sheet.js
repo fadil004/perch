@@ -22,7 +22,8 @@ export function openSheet({ title, sub, body, onClose, className = '' }) {
   const head = title ? h('div', { class: 'sheet-head' }, h('div', { class: 'sheet-title', dir: 'auto' }, title), sub ? h('div', { class: 'sheet-sub' }, sub) : null) : null;
   const bodyEl = h('div', { class: 'sheet-body' });
   const sheet = h('div', { class: `sheet ${className}`, role: 'dialog', 'aria-modal': 'true', 'aria-label': title || 'Sheet' }, grab, head, bodyEl);
-  const setBody = (content) => { bodyEl.replaceChildren(...[].concat(content || [])); refreshTouch(); };
+  // (null entries are rows left out, as in h(); replaceChildren would print them as text)
+  const setBody = (content) => { bodyEl.replaceChildren(...[].concat(content || []).filter((x) => x != null && x !== false)); refreshTouch(); };
   root.append(scrim, sheet);
 
   let y = 0, H = 0, anim = null, closing = false, closed = false;
@@ -31,13 +32,22 @@ export function openSheet({ title, sub, body, onClose, className = '' }) {
     sheet.style.transform = `translateY(${v}px)`;
     scrim.style.opacity = String(Math.max(0, Math.min(1, 1 - v / (H || 1))));
   };
+  let touchQueued = false;
   const refreshTouch = () => {
+    if (touchQueued) return;
+    touchQueued = true;
     requestAnimationFrame(() => {
+      touchQueued = false;
       // When nothing scrolls, the whole sheet is a drag surface.
       bodyEl.style.touchAction = bodyEl.scrollHeight <= bodyEl.clientHeight + 1 ? 'none' : 'pan-y';
     });
   };
   setBody(body);
+  // Content that arrives later (progress rows, a video preview) can make the body scroll: check again.
+  const grew = new MutationObserver(refreshTouch);
+  grew.observe(bodyEl, { childList: true, subtree: true });
+  bodyEl.addEventListener('loadedmetadata', refreshTouch, true);
+  bodyEl.addEventListener('load', refreshTouch, true);
 
   H = sheet.getBoundingClientRect().height;
   apply(H);
@@ -53,6 +63,7 @@ export function openSheet({ title, sub, body, onClose, className = '' }) {
   const finish = () => {
     if (closed) return;
     closed = true;
+    grew.disconnect();
     scrim.remove();
     sheet.remove();
     if (current === api) current = null;

@@ -5,6 +5,7 @@ import { kv, swkv, wipeAll } from './store.js';
 import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
 import { extractUrl, saveLink, recentLinks, siteOf } from './inbox.js';
 import { createUploader, stash } from './uploads.js';
+import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError } from './bridge.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -39,6 +40,7 @@ const SHARE_KEY = 'perch.share';     // a link shared to Perch, kept until it's 
 const SHARE_TTL = 60 * 60_000;
 const SHARE_FILES_KEY = 'perch.share.files';   // videos just shared to Perch: show them uploading once the app is ready
 let uploader = null;                           // see up()
+const phoneClaims = new Map();                 // phone downloader job id → { p, listen }: its files being copied in (once, sheet open or not)
 
 const el = {
   onboard: $('#onboard'), libs: $('#libs'), syncing: $('#syncing'), main: $('#main'),
@@ -151,6 +153,9 @@ async function boot() {
   const swReady = registerServiceWorker();
   const params = new URLSearchParams(location.search);
   takeSharedLink(params);
+  // The phone downloader's installer opens Perch with #bridge=<token>. Asking it right away also brings up
+  // Chrome's one-time "allow access to this device" prompt now, in context.
+  if (takePairing()) setTimeout(() => { toast('Phone downloader connected'); ping(); }, 400);
   const red = consumeRedirect();
   if (red && red.ok) {
     lsSet('perch.mode', { mode: 'drive' });
@@ -934,6 +939,8 @@ function openMore() {
     },
   }, String(n))));
   const syncMeta = h('span', { class: 'meta' }, S.syncing ? 'Syncing…' : S.snap ? timeAgo(S.snap.lastSync) : '');
+  const bridgeMeta = h('span', { class: 'meta' }, paired() ? '' : 'Set up');
+  if (paired()) ping().then((info) => { bridgeMeta.textContent = info ? 'On' : 'Off'; });
   const sheet = openSheet({
     title: S.lib?.name || 'Perch',
     sub: S.snap ? `${S.model.visible.length.toLocaleString('en')} references` : '',
@@ -946,6 +953,8 @@ function openMore() {
         h('span', { class: 'ico', html: I.sync }), h('span', { class: 'label' }, 'Sync now'), syncMeta),
       h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openSaveLink(); } },
         h('span', { class: 'ico', html: I.inbox }), h('span', { class: 'label' }, 'Save to Eagle'), h('span', { class: 'ico', html: I.chevronR })),
+      ANDROID || paired() ? h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openPhoneDownloader(); } },
+        h('span', { class: 'ico', html: I.phone }), h('span', { class: 'label' }, 'Phone downloader'), bridgeMeta) : null,
       canInstall() ? h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openInstallSheet(); } },
         h('span', { class: 'ico', html: I.plusSquare }), h('span', { class: 'label' }, 'Install app')) : null,
       h('div', { class: 'sep' }),
@@ -1029,9 +1038,10 @@ function handleSharedLink() {
     if (Date.now() - files < SHARE_TTL) { openSaveLink(); return; }
   }
   const p = lsGet(SHARE_KEY);
-  if (!p) return;
-  if (Date.now() - p.t > SHARE_TTL) { lsSet(SHARE_KEY, null); return; }
-  openSaveLink({ url: p.url, auto: true });
+  if (p && Date.now() - p.t <= SHARE_TTL) { openSaveLink({ url: p.url, auto: true, pc: !!p.pc }); return; }
+  if (p) lsSet(SHARE_KEY, null);
+  // A download on the phone that was still running when Perch closed: pick it up and finish it.
+  if (paired() && activeJobs().some((j) => Date.now() - j.t < SHARE_TTL)) openSaveLink();
 }
 
 const LINK_STATUS = {
@@ -1043,15 +1053,31 @@ const LINK_STATUS = {
 };
 const FILE_STATUS = { ...LINK_STATUS, pending: 'Uploaded · waiting for Eagle on PC', queued: 'Adding to Eagle…', downloading: 'Adding to Eagle…', error: 'Couldn’t add' };
 
-function openSaveLink({ url = '', auto = false } = {}) {
+function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   const writable = canSend();
   const libName = (S.lib?.name || '').replace(/\.library$/i, '');
   const input = h('input', { class: 'field', type: 'url', placeholder: 'Paste a video link', value: url, autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
   const err = h('div', { class: 'err' });
   const saveBtn = h('button', { class: 'btn-primary', type: 'button' }, writable ? 'Save link' : 'Allow & save');
+  const pcBtn = h('button', { class: 'btn-quiet dl-pc', type: 'button', hidden: true, onclick: () => save() }, 'Save for computer instead');
+  const linkNote = h('p', { class: 'link-note' });
   const recent = h('div', { class: 'link-list' });
   const done = h('div', { class: 'link-done', hidden: true });
   const uploads = h('div', { class: 'link-list' });
+  const phoneList = h('div', { class: 'dl-list' });
+  let closed = false;
+
+  // ── the phone downloader (Termux): when it answers, a link downloads on this phone and the computer is
+  // the quiet alternative. Asked once per sheet; a download card waits for the same answer.
+  let bridgeUp = false;
+  const bridgeP = paired() ? ping() : Promise.resolve(null);
+  bridgeP.then((info) => { if (!closed) { bridgeUp = !!info; linkMode(); } });
+  function linkMode() {
+    saveBtn.textContent = bridgeUp ? 'Download' : writable ? 'Save link' : 'Allow & save';
+    pcBtn.hidden = !bridgeUp;
+    linkNote.textContent = bridgeUp ? 'Downloads on this phone, then Eagle adds it.' : 'Video Grabber downloads it when Eagle is open on your computer.';
+  }
+  linkMode();
 
   // ── a video already on the phone
   const picker = h('input', { type: 'file', accept: 'video/*,image/*', multiple: true, hidden: true });
@@ -1095,38 +1121,177 @@ function openSaveLink({ url = '', auto = false } = {}) {
   }
   const onUploads = (items) => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => renderUploads(items)); };
 
-  // ── a link (Video Grabber downloads it)
-  async function save() {
+  // ── a link for the computer (Video Grabber downloads it). `why` says why the phone didn't.
+  function showDone(title, sub) {
+    done.hidden = false;
+    done.replaceChildren(h('span', { class: 'ico', html: I.check }),
+      h('div', null, h('div', { class: 'link-done-title' }, title), h('div', { class: 'link-done-sub' }, sub)));
+  }
+  function askWriteFor(link) {
+    // First time: Google asks once to let Perch create files (it only ever sees files it made).
+    lsSet(SHARE_KEY, { url: link, t: Date.now(), pc: true });
+    saveUiState();
+    S.redirecting = true;
+    signIn({ write: true });
+  }
+  async function save(link = extractUrl(input.value), why = '') {
     err.textContent = '';
-    const link = extractUrl(input.value);
     if (!link) { err.textContent = 'That doesn’t look like a link.'; return; }
-    if (!writable) {
-      // First time: Google asks once to let Perch create files (it only ever sees files it made).
-      lsSet(SHARE_KEY, { url: link, t: Date.now() });
-      saveUiState();
-      S.redirecting = true;
-      signIn({ write: true });
-      return;
-    }
-    saveBtn.disabled = true;
+    if (!writable) { askWriteFor(link); return; }
+    saveBtn.disabled = pcBtn.disabled = true;
     saveBtn.textContent = 'Saving…';
     try {
       await saveLink(S.drive, S.modeKey, { url: link, library: S.lib });
       lsSet(SHARE_KEY, null);
-      input.value = '';
-      done.hidden = false;
-      done.replaceChildren(h('span', { class: 'ico', html: I.check }),
-        h('div', null, h('div', { class: 'link-done-title' }, 'Saved'),
-          h('div', { class: 'link-done-sub' }, `It downloads into ${libName ? `“${libName}”` : 'Eagle'} the next time Eagle is open on your computer.`)));
+      if (extractUrl(input.value) === link) input.value = '';
+      if (why) showDone('Saved for your computer', `${why} Eagle downloads it the next time it’s open on your computer.`);
+      else showDone('Saved', `It downloads into ${libName ? `“${libName}”` : 'Eagle'} the next time Eagle is open on your computer.`);
       loadRecent();
     } catch (e) {
       const scope = e.name === 'DriveError' && e.status === 403 && /insufficient|scope|permission/i.test(e.message);
-      if (scope) { lsSet(SHARE_KEY, { url: link, t: Date.now() }); saveUiState(); S.redirecting = true; signIn({ write: true }); return; }
+      if (scope) { askWriteFor(link); return; }
       err.textContent = e.name === 'AuthError' ? 'Google sign-in expired — try again.' : (e.message || 'Couldn’t save the link');
     } finally {
-      saveBtn.disabled = false;
-      saveBtn.textContent = 'Save link';
+      saveBtn.disabled = pcBtn.disabled = false;
+      linkMode();
     }
+  }
+
+  // ── a link downloaded on this phone
+  const cards = new Map();   // job id → card, so the same job never shows twice
+  const blobUrls = [];
+  function download() {
+    err.textContent = '';
+    const link = extractUrl(input.value);
+    if (!link) { err.textContent = 'That doesn’t look like a link.'; return; }
+    input.value = '';
+    phoneCard({ url: link });
+  }
+  /** The phone couldn't (or the user chose the computer): save the link for Video Grabber instead. */
+  function phoneFailed(link, why) {
+    if (canSend() || !why) { save(link, why); return; }
+    // Saving for the computer needs Google's OK first: leave the link ready for one tap.
+    input.value = link;
+    err.textContent = why;
+  }
+  function phoneCard({ url: link, id = '' }) {
+    const head = h('div', { class: 'group-label' }, 'Downloading on this phone');
+    const title = h('div', { class: 'link-title', dir: 'auto' }, siteOf(link));
+    const meta = h('div', { class: 'link-meta' }, 'Starting…');
+    const fill = h('i');
+    const media = h('div', { class: 'dl-media', hidden: true });
+    const alt = h('button', { class: 'dl-alt', type: 'button', onclick: () => giveUp('') }, 'Save for computer instead');
+    const el = h('div', { class: 'dl indet' }, head, h('div', { class: 'dl-card' }, title, meta, h('div', { class: 'up-bar' }, fill), media, alt));
+    phoneList.append(el);
+    let timer = 0, misses = 0, over = false;
+    const card = { stop: () => clearTimeout(timer) };
+
+    const show = (text, p = null, state = '') => {
+      meta.textContent = text;
+      el.classList.toggle('indet', p == null && !state);
+      fill.style.width = p == null ? '' : `${Math.round(Math.min(1, p) * 100)}%`;
+      if (state) el.dataset.state = state;
+    };
+    const forget = () => { if (id) { forgetJob(id); finishJob(id).catch(() => {}); cards.delete(id); } };
+    function giveUp(reason, detail = '') {
+      over = true;
+      clearTimeout(timer);
+      forget();
+      el.remove();
+      if (reason === 'off' || reason === 'auth') { bridgeUp = false; linkMode(); }
+      const why = reason === 'off' ? 'Phone downloader is off.'
+        : reason === 'auth' ? 'Phone downloader needs setting up again.'
+        : reason === 'gone' ? 'The download on the phone was lost.'
+        : reason ? `${String(detail || 'Couldn’t download it on this phone').replace(/[.!]?\s*$/, '.')}` : '';
+      phoneFailed(link, why);
+    }
+
+    async function begin() {
+      if (!(await bridgeP)) return giveUp(pingProblem() === 'auth' ? 'auth' : 'off');
+      if (closed) return;
+      if (!id) {
+        try { ({ id } = await startDownload(link)); } catch (e) { return giveUp(e.code === 'auth' ? 'auth' : e.code === 'off' ? 'off' : 'job', e.message); }
+        rememberJob(id, link);
+        if (lsGet(SHARE_KEY)?.url === link) lsSet(SHARE_KEY, null);   // the phone has it now
+      }
+      if (cards.has(id)) { el.remove(); return; }   // the bridge already had this link going: that card shows it
+      cards.set(id, card);
+      poll();
+    }
+    async function poll() {
+      if (closed || over) return;
+      let j;
+      try {
+        j = await getJob(id);
+        misses = 0;
+      } catch (e) {
+        if (closed) return;
+        if (e.code === 'notfound') {
+          if (phoneClaims.has(id)) return claim(null);
+          // Gone from the bridge: kept by another Perch window (it forgets the job once it has the file), or lost.
+          return activeJobs().some((x) => x.id === id) ? giveUp('gone') : keptElsewhere();
+        }
+        if (e.code === 'auth') return giveUp('auth');
+        if (++misses >= 6) return giveUp('off');
+        timer = setTimeout(poll, 700);
+        return;
+      }
+      if (closed) return;
+      if (j.title) title.textContent = j.title;
+      if (j.status === 'done') return claim(j);
+      if (j.status === 'error') return failed(j);
+      show(...jobText(j));
+      timer = setTimeout(poll, 700);
+    }
+    function failed(j) {
+      // Links that can never work: just say so. Anything else may still work on the computer.
+      if (j.code !== 'unsupported' && j.code !== 'novideo') return giveUp('job', j.error);
+      over = true;
+      forget();
+      alt.hidden = true;
+      head.textContent = 'Couldn’t download';
+      show(j.error || 'There’s no video to save here.', null, 'error');
+    }
+    async function claim(j) {
+      over = true;
+      alt.hidden = true;
+      let c = phoneClaims.get(id);
+      if (!c) {
+        c = { listen: null };
+        c.p = claimOnce(id, link, j, (got, total) => c.listen && c.listen(got, total));
+        phoneClaims.set(id, c);
+        c.p.then(() => phoneClaims.delete(id), () => phoneClaims.delete(id));
+      }
+      c.listen = (got, total) => { if (!closed) show(`Almost done · ${total ? Math.floor((100 * got) / total) : 0}%`, total ? got / total : null); };
+      show('Almost done', null);
+      try {
+        const files = await c.p;
+        if (!closed) { if (files) ready(files, j); else keptElsewhere(); }
+      } catch (e) {
+        if (!closed) giveUp('job', e.message);
+      }
+    }
+    function keptElsewhere() {
+      over = true;
+      cards.delete(id);
+      alt.hidden = true;
+      head.textContent = 'Downloaded on this phone';
+      show('Saved in another Perch window', 1, 'done');
+    }
+    function ready(files, j) {
+      el.classList.remove('indet');
+      head.textContent = 'Downloaded on this phone';
+      title.textContent = j?.title || files[0].name;
+      const size = files.reduce((a, f) => a + f.size, 0);
+      show(files.length > 1 ? `${files.length} files · ${fmtBytes(size)}` : fmtBytes(size), 1, 'done');
+      const f = files.find((x) => /^video\//.test(x.type)) || files[0];
+      const src = URL.createObjectURL(f);
+      blobUrls.push(src);
+      media.replaceChildren(/^image\//.test(f.type) ? h('img', { src, alt: '' }) : h('video', { src, controls: true, playsinline: true, preload: 'metadata' }));
+      media.hidden = false;
+    }
+    begin();
+    return card;
   }
 
   async function loadRecent() {
@@ -1147,8 +1312,9 @@ function openSaveLink({ url = '', auto = false } = {}) {
     } catch { /* the list is a nicety */ }
   }
 
-  saveBtn.addEventListener('click', save);
-  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+  const primary = () => (bridgeUp ? download() : save());
+  saveBtn.addEventListener('click', primary);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') primary(); });
   const paste = navigator.clipboard && navigator.clipboard.readText
     ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) input.value = u; else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
     : null;
@@ -1158,19 +1324,173 @@ function openSaveLink({ url = '', auto = false } = {}) {
   const form = h('div', { class: 'form' },
     h('div', { class: 'group-label flush' }, 'Or a link'),
     h('div', { class: 'field-row' }, input, paste), err,
-    h('p', { class: 'link-note' }, 'Video Grabber downloads it when Eagle is open on your computer.'),
-    saveBtn);
+    linkNote,
+    saveBtn, pcBtn);
   S.shareOpen = true;
   uploadListeners.add(onUploads);
   openSheet({
     title: 'Save to Eagle',
     sub: writable ? (libName ? `Into “${libName}”` : '') : 'Google will ask once to let Perch save to your Drive. Perch can only see the files it saves.',
-    body: [uploads, phone, done, form, recent],
-    onClose: () => { S.shareOpen = false; uploadListeners.delete(onUploads); cancelAnimationFrame(frame); up().clearSaved(); },
+    body: [phoneList, uploads, phone, done, form, recent],
+    onClose: () => {
+      S.shareOpen = false;
+      closed = true;   // downloads carry on in the phone downloader; the next sheet picks them up
+      for (const c of cards.values()) c.stop();
+      for (const u of blobUrls) URL.revokeObjectURL(u);
+      uploadListeners.delete(onUploads);
+      cancelAnimationFrame(frame);
+      up().clearSaved();
+    },
   });
   up().refresh();
-  if (auto && writable) save();
+  if (paired()) for (const j of activeJobs()) phoneCard(j);   // downloads still going from before
+  if (auto && url) {
+    if (paired() && !pc) { input.value = ''; phoneCard({ url }); }
+    else if (writable) save(url);
+  }
   if (S.drive) loadRecent();
+}
+
+/** "42% · 1.2 MB of 2.9 MB" and the bar fraction (null: unknown) for a job in the phone downloader. */
+function jobText(j) {
+  if (j.status === 'queued') return ['Waiting…', null];
+  if (j.status === 'processing') return ['Finishing…', 1];
+  const p = j.progress != null ? j.progress : j.total ? j.downloaded / j.total : null;
+  const size = j.total ? `${fmtBytes(j.downloaded)} of ${fmtBytes(j.total)}` : fmtBytes(j.downloaded);
+  return [[p != null ? `${Math.floor(p * 100)}%` : '', size].filter(Boolean).join(' · ') || 'Downloading…', p];
+}
+
+/**
+ * The installed app and a browser tab may both be watching the same job: only one copies it in. The other
+ * waits its turn and then finds the job already kept (null).
+ */
+function claimOnce(id, url, job, onProgress) {
+  const mine = () => (activeJobs().some((x) => x.id === id) ? copyIn(id, url, job, onProgress) : null);
+  return navigator.locks ? navigator.locks.request(`perch-bridge-${id}`, mine) : mine();
+}
+
+/**
+ * Copy a finished download from the phone downloader into Perch and queue it for Drive (the source link goes
+ * with it, so Eagle records the website). Runs to the end even if the sheet closes meanwhile.
+ */
+async function copyIn(id, url, job, onProgress) {
+  const list = (job && job.files) || [];
+  const total = list.reduce((a, f) => a + (Number(f.size) || 0), 0);
+  const files = [];
+  let before = 0;
+  for (const f of list) {
+    const file = await fetchFile(id, f.n, (got) => onProgress(before + got, total), f);
+    files.push(file);
+    before += file.size;
+  }
+  if (!files.length) throw new BridgeError('novideo', 'There’s no video to save here.');
+  await stash(files, { url });
+  forgetJob(id);
+  finishJob(id).catch(() => {});   // safely on this phone: the downloader can drop its copy
+  if (canSend()) up().run(); else askWrite();
+  return files;
+}
+
+// ── phone downloader ─────────────────────────────────────────────────────────
+// yt-dlp in Termux on the phone (js/bridge.js). Android only; the row shows elsewhere once it's paired.
+const ANDROID = /Android/i.test(navigator.userAgent);
+const INSTALL_CMD = 'curl -fsSL https://fadil004.github.io/perch/bridge/install.sh | bash';
+const TERMUX_URL = 'https://github.com/termux/termux-app/releases';
+
+function cookieLine(c) {
+  if (!c || !c.present) return 'No cookies — Instagram and X may need them';
+  const from = c.source === 'file' ? 'from a file' : '';
+  const when = Date.parse(c.updated || c.sourceTime || '');
+  return `Cookies: ${[from, when ? timeAgo(when) : '', siteNames(c.sites || [])].filter(Boolean).join(' · ') || `${c.count || 0}`}`;
+}
+
+function openPhoneDownloader() {
+  const cookieFile = h('input', { type: 'file', accept: '.txt,text/plain', hidden: true });
+  const sheet = openSheet({
+    title: 'Phone downloader',
+    sub: 'Downloads shared links right on this phone.',
+    body: h('div', { class: 'group-label' }, 'Checking…'),
+  });
+  let closed = false;
+  sheet.closed.then(() => { closed = true; });
+
+  const status = (state, text, ...lines) => h('div', { class: `dl-status ${state}` },
+    h('span', { class: 'link-dot' }),
+    h('div', { class: 'link-text' }, h('div', { class: 'link-title' }, text), ...lines.filter(Boolean).map((l) => h('div', { class: 'link-meta' }, l))));
+  const row = (icon, label, onclick) => h('button', { class: 'row', type: 'button', onclick }, h('span', { class: 'ico', html: icon }), h('span', { class: 'label' }, label));
+  const note = (text) => h('p', { class: 'link-note dl-note' }, text);
+  const setupBtn = (label) => h('div', { class: 'form' }, h('button', { class: 'btn-primary', type: 'button', onclick: () => openBridgeSetup() }, label));
+
+  function body(info, why) {
+    if (info) {
+      const c = info.cookies;
+      return [
+        status('on', 'Connected', `yt-dlp ${info.ytdlp || '?'}${info.busy ? ` · ${info.busy} downloading` : ''}`, cookieLine(c)),
+        c && c.present ? null : note('Export a cookies.txt on this phone (e.g. Firefox with the “cookies.txt” add-on, signed in to the site), then add it here.'),
+        row(I.doc, 'Add cookies file', () => cookieFile.click()),
+        c && c.present ? row(I.x, 'Remove cookies', removeCookies) : null,
+        row(I.download, 'Setup steps', () => openBridgeSetup()),
+        cookieFile,
+      ];
+    }
+    if (why === 'unpaired') {
+      return [status('', 'Not set up', 'Download Instagram, TikTok and YouTube links on this phone'), setupBtn('Set up')];
+    }
+    if (why === 'auth') {
+      return [status('error', 'Not connected', 'The downloader on this phone has another key'), note('Run the setup command in Termux again.'), setupBtn('Set up again')];
+    }
+    return [
+      status('error', 'Off — open Termux', 'Links are saved for your computer meanwhile'),
+      note('Open Termux to start it. Still off with Termux open? Chrome may be blocking it: allow “Local network access” for this site in Chrome’s site settings.'),
+      row(I.sync, 'Try again', () => { sheet.setBody(h('div', { class: 'group-label' }, 'Checking…')); refresh(); }),
+      row(I.download, 'Setup steps', () => openBridgeSetup()),
+    ];
+  }
+  async function refresh() {
+    const info = await ping();
+    if (!closed) sheet.setBody(body(info, pingProblem()));
+  }
+  async function removeCookies() {
+    try { await clearCookies(); toast('Cookies removed'); } catch { toast('Couldn’t remove the cookies'); }
+    refresh();
+  }
+  cookieFile.addEventListener('change', async () => {
+    const f = cookieFile.files[0];
+    cookieFile.value = '';
+    if (!f) return;
+    if (f.size > 5_000_000) { toast('That file is too big to be cookies'); return; }
+    try {
+      const r = await pushCookies(await f.text(), 'file', '');
+      toast('Cookies added', r.sites && r.sites.length ? ` · ${siteNames(r.sites)}` : '');
+    } catch (e) {
+      toast(e.code === 'bad' ? 'No cookies found in that file' : 'Couldn’t add the cookies');
+    }
+    refresh();
+  });
+  refresh();
+}
+
+function openBridgeSetup() {
+  const code = h('code', null, INSTALL_CMD);
+  const copy = h('button', { class: 'cmd-copy', type: 'button', onclick: async () => {
+    try { await navigator.clipboard.writeText(INSTALL_CMD); toast('Copied'); } catch {
+      getSelection().selectAllChildren(code);   // no clipboard access: leave it selected for a long-press copy
+      toast('Select the command and copy it');
+    }
+  } }, h('span', { class: 'ico', html: I.copy }), 'Copy');
+  const step = (n, ...parts) => h('li', null, h('span', { class: 'step-n' }, String(n)), h('span', { class: 'step-t' }, ...parts));
+  openSheet({
+    title: 'Set up the phone downloader',
+    sub: 'Once, on this phone. Takes a couple of minutes.',
+    body: [
+      h('ol', { class: 'steps' },
+        step(1, 'Install ', h('b', null, 'Termux'), ' from F-Droid or ', h('a', { href: TERMUX_URL, target: '_blank', rel: 'noopener' }, 'GitHub'), '.'),
+        step(2, 'Open Termux.'),
+        step(3, 'Paste this command and press Enter:', h('div', { class: 'cmd' }, code, copy)),
+        step(4, 'Settings → Apps → Termux → Battery → ', h('b', null, 'Unrestricted'), ', so Android doesn’t stop it.')),
+      h('p', { class: 'link-note dl-note' }, 'When it finishes, Perch opens and says “Phone downloader connected”. Leave Termux running in the background.'),
+    ],
+  });
 }
 
 function confirmSignOut() {

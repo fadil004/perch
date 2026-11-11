@@ -36,6 +36,10 @@ export const I = {
   share: s('<path d="M12 3.75v10.5"/><path d="m8.4 7.1 3.6-3.4 3.6 3.4"/><path d="M8.75 10.25h-1.5a1.5 1.5 0 0 0-1.5 1.5v7a1.5 1.5 0 0 0 1.5 1.5h9.5a1.5 1.5 0 0 0 1.5-1.5v-7a1.5 1.5 0 0 0-1.5-1.5h-1.5"/>'),
   menuV: s(dot(12, 5.5, 1.5) + dot(12, 12, 1.5) + dot(12, 18.5, 1.5)),
   plusSquare: s('<rect x="4.25" y="4.25" width="15.5" height="15.5" rx="3.5"/><path d="M12 8.5v7M8.5 12h7"/>'),
+  // Phone downloader: a phone with an arrow down; a document for the cookies file.
+  phone: s('<rect x="6.75" y="3.25" width="10.5" height="17.5" rx="2.4"/><path d="M12 7.5v6.25"/><path d="m9.6 11.5 2.4 2.4 2.4-2.4"/>'),
+  download: s('<path d="M12 4.25v10.5"/><path d="m7.75 10.75 4.25 4.25 4.25-4.25"/><path d="M4.75 15.75v2.5a1.5 1.5 0 0 0 1.5 1.5h11.5a1.5 1.5 0 0 0 1.5-1.5v-2.5"/>'),
+  doc: s('<path d="M7.25 3.75h6.5l4 4v11a1.5 1.5 0 0 1-1.5 1.5h-9a1.5 1.5 0 0 1-1.5-1.5V5.25a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M13.5 3.75v4.25h4.25M9 12.5h6M9 16h4"/>'),
   // Brand-neutral mark: a dot resting on a perch.
   mark: `<svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="29.5" cy="21.5" r="5.5" fill="currentColor" stroke="none"/><path d="M9 31h30" stroke-width="2.6"/></svg>`,
 };
