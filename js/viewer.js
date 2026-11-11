@@ -379,8 +379,21 @@ export class Viewer {
     if (!auth) { this.fail(slot, this.mediaSrc.lastError ? this.mediaSrc.lastError() : null); return; }
     this.showMsg(slot, 'Refreshing…');
     const t = v.currentTime > 0 ? v.currentTime : (slot.lastTime || 0);
-    const started = this.onAuthNeeded ? this.onAuthNeeded({ id: it.id, t, playing: slot.playing }) : false;
-    if (!started && slot.video === v) this.showMsg(slot, 'Reconnect to play', () => this.onReconnect && this.onReconnect());
+    const playing = slot.playing;
+    const r = this.onAuthNeeded ? await this.onAuthNeeded({ id: it.id, t, playing }) : false;
+    if (slot.video !== v) return;
+    if (r === 'renewed') {
+      // Fresh token in place: load the same video again and carry on from the same frame.
+      if (slot.msg) { slot.msg.remove(); slot.msg = null; }
+      this.dropStepper(slot);
+      try { v.pause(); } catch { /* ignore */ }
+      v.removeAttribute('src'); v.load(); v.remove();
+      slot.video = null;
+      slot.resume = { t, playing };
+      this.activate(slot);
+      return;
+    }
+    if (!r) this.showMsg(slot, 'Reconnect to play', () => this.onReconnect && this.onReconnect());
   }
 
   playResumed(v) {
@@ -566,6 +579,17 @@ export class Viewer {
     for (const s of [this.slots[0], this.slots[2]]) {
       const it = s.item;
       if (it && (it.kind === 'image') && !s.full) this.loadFull(s);
+    }
+    // Neighbouring videos: once this one has had a moment to start, get the next and previous ready.
+    clearTimeout(this.prefetchTimer);
+    if (this.mediaSrc.prefetch) {
+      this.prefetchTimer = setTimeout(() => {
+        if (!this.isOpen) return;
+        for (const s of [this.slots[2], this.slots[0]]) {
+          const it = s.item;
+          if (it && it.kind === 'video' && it.f.main) this.mediaSrc.prefetch(it.f.main, it.size || 0);
+        }
+      }, 1200);
     }
     for (const k of [this.index + 2, this.index - 2]) {
       const it = this.items[k];

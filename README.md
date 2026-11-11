@@ -107,14 +107,24 @@ Any static host works (Netlify, Cloudflare Pages, Vercel). It must be HTTPS, and
 
 **Bump `VERSION` in `sw.js` on every deploy** (e.g. `perch-v2` → `perch-v3`). Without the bump, installed phones keep serving old cached files.
 
-How caching works: the app page and `config.js` load network-first and fall back to the cache after 3 s or when offline, so a newly filled-in client ID arrives right away. Other files are served from cache and refreshed in the background (stale-while-revalidate). On `localhost` everything is always fresh.
+How caching works: the app shell (page, scripts, `config.js`) is served from the cache at once and refreshed in the background (stale-while-revalidate), so the app opens instantly, also on the way back from Google. A deploy installs a new service worker that precaches the new files; the next launch runs them. On `localhost` everything is always fresh.
+
+Videos: small files (≤ 30 MB) are kept whole in a media cache (LRU, 600 MB). The first play streams and fills the cache from the same download; replays and seeks then come from the phone, and the viewer asks for the next and previous videos ahead of time so swiping to them starts at once. Skipped on Data Saver and 2G.
+
+## Save links to Eagle (share from the phone)
+
+Share any video page to **Perch** (Android share sheet), or open **⋯ → Save a link to Eagle** and paste the link (iPhone and everywhere else). Perch saves the link as a small JSON file in **My Drive / Perch Inbox**. The **Video Grabber** Eagle plugin (with its Perch inbox support) finds that folder through Google Drive for desktop, downloads the video with yt-dlp the next time Eagle is open on the computer, adds it to the library (tag `perch`), and writes the outcome back into the file, which Perch shows under **Recent**.
+
+- The first save asks Google once for `drive.file`: Perch can create files and see only the files it created. Reading the library stays `drive.readonly`.
+- A link is downloaded into the library that was open in Perch when it was saved. If Eagle has another library open, the link waits until that library is opened.
+- The share-sheet entry needs the app installed from Chrome (Android). After this update it can take a day to appear; removing and re-adding the app applies it at once.
 
 ## Privacy and limits
 
 - **Access:**
-  - Scope is `drive.readonly`. Perch never writes to Drive or Eagle.
+  - Scope is `drive.readonly`. The only writes are the link inbox (`drive.file`, asked for the first time a link is saved): Perch can only create files and see the ones it made. It never changes your library.
   - The OAuth token lives in this browser only: localStorage, plus the Cache API so the service worker can stream video.
-  - Tokens expire after an hour and there is no refresh token. Perch renews silently (`prompt=none` with `login_hint` = the account's email, learned from Drive after sign-in) at launch, on resume when under 10 minutes are left, and after any 401. It saves the screen state first (library, folder, search, scroll, open item, video time) and restores it after the redirect. At most one silent attempt per 2 minutes. **Reconnect** only appears when Google says the user must act (`interaction_required`, `login_required`, `consent_required`, `account_selection_required`).
+  - Tokens expire after an hour and there is no refresh token. Perch renews silently (`prompt=none` with `login_hint` = the account's email, learned from Drive after sign-in) shortly before expiry, at launch, on resume when under 10 minutes are left, and after any 401 (the failed request is then retried). The renew runs in a hidden frame first, so the app stays on screen; where the frame can't see the Google session (third-party cookies blocked, e.g. iOS), it falls back to a page redirect that saves the screen state first (library, folder, search, scroll, open item, video time) and restores it after. At most one redirect attempt per 2 minutes. **Reconnect** only appears when Google says the user must act (`interaction_required`, `login_required`, `consent_required`, `account_selection_required`).
   - **Sign out** revokes the token and deletes all cached data on the device.
 - **Folder passwords:** compared on-device against the value Eagle stores in `metadata.json`.
 - **Not supported yet:** smart folders (their rules aren't evaluated).

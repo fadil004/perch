@@ -601,6 +601,26 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .prose code { font: 500 13px ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1); background: var(--fill); padding: 1px 5px; border-radius: 5px; }
 .foot-note { padding: 14px 12px 0; font-size: 12px; color: var(--t3); text-align: center; letter-spacing: .01em; }
 
+/* Save to Eagle (link inbox) */
+.field-row { display: flex; gap: 8px; align-items: stretch; }
+.field-row .field { flex: 1; min-width: 0; }
+.field-row .btn-quiet { flex: none; padding: 0 14px; border-radius: 12px; background: var(--fill); color: var(--t1); font-size: 15px; }
+.link-note { font-size: 13px; color: var(--t2); line-height: 1.45; padding: 0 2px; margin: 0; }
+.link-done { display: flex; gap: 12px; align-items: flex-start; margin: 4px 12px 10px; padding: 14px; border-radius: 14px; background: var(--fill); }
+.link-done[hidden] { display: none; }
+.link-done .ico { width: 26px; height: 26px; flex: none; border-radius: 50%; background: #30d158; color: #000; display: grid; place-items: center; }
+.link-done .ico svg { width: 16px; height: 16px; stroke-width: 2.4; }
+.link-done-title { font-size: 16px; font-weight: 600; color: var(--t1); }
+.link-done-sub { font-size: 13px; color: var(--t2); line-height: 1.45; margin-top: 2px; }
+.link-row { display: flex; gap: 12px; align-items: center; padding: 9px 12px; }
+.link-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--t3); }
+.link-row.queued .link-dot, .link-row.downloading .link-dot { background: #0a84ff; }
+.link-row.done .link-dot { background: #30d158; }
+.link-row.error .link-dot { background: #ff6961; }
+.link-text { flex: 1; min-width: 0; }
+.link-title { font-size: 15px; color: var(--t1); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.link-meta { font-size: 12px; color: var(--t2); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 /* ───────────────────────── Viewer */
 
 .viewer {

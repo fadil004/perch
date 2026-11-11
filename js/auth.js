@@ -1,8 +1,11 @@
 // Google OAuth 2.0 implicit flow with a full-page redirect.
 // Popups break inside iOS home-screen apps; a redirect works everywhere.
-// Tokens last an hour and there is no refresh token, so the app renews them with a silent
-// (prompt=none) redirect that names the account (login_hint): on a phone signed in to several Google
-// accounts, prompt=none without a hint asks the user to pick one instead of renewing.
+// Tokens last an hour and there is no refresh token. They are renewed with a silent (prompt=none)
+// request that names the account (login_hint): on a phone signed in to several Google accounts,
+// prompt=none without a hint asks the user to pick one instead of renewing.
+// The silent request first runs in a hidden frame (the app stays on screen; Google answers in about a
+// second). Where the frame can't see the Google session (third-party cookies blocked, e.g. iOS), it
+// falls back to the full-page redirect.
 import { GOOGLE_CLIENT_ID } from '../config.js';
 import { lsGet, lsSet } from './util.js';
 
@@ -14,10 +17,18 @@ const STATE_KEY = 'perch.oauth.state';
 const SILENT_KEY = 'perch.oauth.silent';
 const ACCOUNT_KEY = 'perch.account';      // email of the Drive account; outlives any single token
 const NEEDS_USER_KEY = 'perch.oauth.needsUser'; // set when Google said a silent renew needs the user
+const WRITE_KEY = 'perch.scope.write';    // the user allowed "save links to Eagle" (adds drive.file)
+const FRAME_KEY = 'perch.oauth.frame';    // { failedAt } after a frame renew failed, { bad } when it can't work here
+const FRAME_RETRY = 3 * 24 * 3600_000;    // try the frame again after 3 days
 const STATE_TTL = 10 * 60_000;
 const SILENT_GAP = 2 * 60_000;            // at most one silent attempt per 2 minutes (no redirect loops)
 export const RENEW_AHEAD = 10 * 60_000;   // renew when less than this is left
 export const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
+/** Only files this app creates (the link inbox). Asked for the first time a link is saved, never before. */
+export const WRITE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const scopes = () => (lsGet(WRITE_KEY) ? `${SCOPE} ${WRITE_SCOPE}` : SCOPE);
+/** The current token may create files (the inbox). */
+export const canWrite = (a = getAuth()) => !!(a && a.scope && a.scope.split(/\s+/).includes(WRITE_SCOPE));
 /** Silent-renew errors that genuinely need the user: only these show the Reconnect pill. */
 export const NEEDS_USER = new Set(['interaction_required', 'login_required', 'consent_required', 'account_selection_required']);
 
@@ -48,23 +59,89 @@ function randomState() {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
-/** Navigate to Google. silent=true asks for a fresh token without UI (works once consent exists). */
-export function signIn({ silent = false } = {}) {
-  const state = randomState();
-  lsSet(STATE_KEY, { state, silent, t: Date.now() });
-  if (silent) lsSet(SILENT_KEY, Date.now());
+function authUrl({ state, silent }) {
   const p = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID.trim(),
     redirect_uri: redirectUri(),
     response_type: 'token',
-    scope: SCOPE,
+    scope: scopes(),
     include_granted_scopes: 'true',
     state,
   });
   const hint = accountHint();
   if (hint) p.set('login_hint', hint);
   if (silent) p.set('prompt', 'none');
-  location.assign(`${AUTH_URL}?${p}`);
+  return `${AUTH_URL}?${p}`;
+}
+
+/**
+ * Navigate to Google. silent=true asks for a fresh token without UI (works once consent exists).
+ * write=true also asks to create files (drive.file), for saving links to the Eagle inbox.
+ */
+export function signIn({ silent = false, write = false } = {}) {
+  if (write) lsSet(WRITE_KEY, true);
+  const state = randomState();
+  lsSet(STATE_KEY, { state, silent, t: Date.now() });
+  if (silent) lsSet(SILENT_KEY, Date.now());
+  location.assign(authUrl({ state, silent }));
+}
+
+/** The hidden-frame renew may work here: signed in before, nothing pending from the user, not known to fail. */
+export function frameRenewAllowed() {
+  if (!hasClientId() || !navigator.onLine || !(getAuth() || accountHint())) return false;
+  if (lsGet(NEEDS_USER_KEY)) return false;
+  const f = lsGet(FRAME_KEY);
+  return !(f && f.bad && Date.now() - f.bad < FRAME_RETRY);
+}
+
+let framePending = null;
+/**
+ * Silent renew in a hidden frame: Google redirects the frame back to this app with the token in the
+ * hash, the frame's page posts it here (see index.html) and the app never leaves the screen.
+ * Resolves { ok: true } with the new token stored, or { error }.
+ */
+export function renewInFrame({ timeout = 6000 } = {}) {
+  if (framePending) return framePending;
+  framePending = new Promise((resolve) => {
+    const state = randomState();
+    const f = document.createElement('iframe');
+    f.setAttribute('aria-hidden', 'true');
+    f.tabIndex = -1;
+    f.style.cssText = 'position:fixed;left:-20px;top:-20px;width:1px;height:1px;border:0;opacity:0;pointer-events:none';
+    let timer = 0;
+    const done = (r) => {
+      clearTimeout(timer);
+      removeEventListener('message', onMessage);
+      f.remove();
+      framePending = null;
+      if (!r.ok) lsSet(FRAME_KEY, { failedAt: Date.now() });
+      resolve(r);
+    };
+    function onMessage(e) {
+      if (e.origin !== location.origin || e.source !== f.contentWindow) return;
+      const hash = e.data && e.data.perchOAuth;
+      if (typeof hash !== 'string') return;
+      const p = new URLSearchParams(hash.replace(/^#/, ''));
+      if (p.get('state') !== state) return;
+      if (p.has('error') || !p.get('access_token')) { done({ error: p.get('error') || 'no_token' }); return; }
+      const prev = getAuth();
+      const auth = {
+        token: p.get('access_token'),
+        exp: Date.now() + (Number(p.get('expires_in')) || 3600) * 1000,
+        scope: p.get('scope') || scopes(),
+      };
+      if (prev && prev.email) auth.email = prev.email;   // login_hint pinned the same account
+      lsSet(AUTH_KEY, auth);
+      lsSet(NEEDS_USER_KEY, null);
+      lsSet(FRAME_KEY, null);
+      done({ ok: true, auth });
+    }
+    addEventListener('message', onMessage);
+    timer = setTimeout(() => done({ error: 'timeout' }), timeout);
+    f.src = authUrl({ state, silent: true });
+    (document.body || document.documentElement).append(f);
+  });
+  return framePending;
 }
 
 /** Silent renew is possible: configured, online, signed in before, and no attempt in the last 2 minutes. */
@@ -92,10 +169,15 @@ export function consumeRedirect() {
     return { error: p.get('error'), silent: !!saved.silent };
   }
   lsSet(NEEDS_USER_KEY, null);
+  if (saved.silent) {
+    // The frame failed moments ago but the page redirect worked: the frame can't see Google's session here.
+    const f = lsGet(FRAME_KEY);
+    if (f && f.failedAt && Date.now() - f.failedAt < 5 * 60_000) lsSet(FRAME_KEY, { bad: Date.now() });
+  }
   const auth = {
     token: p.get('access_token'),
     exp: Date.now() + (Number(p.get('expires_in')) || 3600) * 1000,
-    scope: p.get('scope') || SCOPE,
+    scope: p.get('scope') || scopes(),
   };
   lsSet(AUTH_KEY, auth);   // the account email is filled in from Drive (about) right after
   return { ok: true, auth, silent: !!saved.silent };
@@ -111,6 +193,8 @@ export function signOut() {
   lsSet(AUTH_KEY, null);
   lsSet(ACCOUNT_KEY, null);
   lsSet(NEEDS_USER_KEY, null);
+  lsSet(WRITE_KEY, null);
+  lsSet(FRAME_KEY, null);
   if (a?.token) {
     fetch(REVOKE_URL, {
       method: 'POST',

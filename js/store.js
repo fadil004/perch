@@ -64,6 +64,7 @@ export async function wipeAll() {
     req.onsuccess = req.onerror = req.onblocked = () => resolve();
   });
   try { await caches.delete('perch-kv'); } catch { /* ignore */ }
+  try { await caches.delete('perch-media'); } catch { /* ignore */ }   // videos kept by the service worker
 }
 
 // Small JSON values shared with the service worker (it can't see localStorage).

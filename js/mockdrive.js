@@ -199,8 +199,19 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     return rest;
   };
 
-  async function backend({ path, params }) {
+  let created = 0;
+  async function backend({ path, params, method = 'GET', meta, content }) {
     await sleep(latency * (0.6 + Math.random() * 0.8));
+    if (method === 'POST' && path === 'files' && meta) {
+      // files.create: folders and small uploads (the link inbox) live in memory for the session.
+      const missing = (meta.parents || []).find((pid) => pid !== 'root' && !files.has(pid));
+      if (missing) return fail(404, `File not found: ${missing}.`);
+      const now = new Date().toISOString();
+      const f = { id: `new-${++created}-${Date.now().toString(36)}`, name: meta.name, mimeType: meta.mimeType, parents: meta.parents || ['root'], createdTime: now, modifiedTime: now, trashed: false };
+      add(f);
+      if (content != null) { const text = String(content); patches.set(f.id, async () => JSON.parse(text)); }
+      return json(strip(f));
+    }
     if (path === 'files') {
       let tree;
       try { tree = parseQuery(params.q || ''); } catch (e) { return fail(400, `Invalid Value: ${e.message}`); }

@@ -16,7 +16,7 @@
 <link rel="icon" type="image/png" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <link rel="stylesheet" href="css/app.css">
-<script type="module" src="js/main.js"></script>
+<link rel="modulepreload" href="js/main.js">
 </head>
 <body>
 
@@ -119,6 +119,21 @@
 
 <div class="sheets" id="sheets"></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+// A hidden-frame token renew lands back here with Google's answer in the hash: hand it to the app
+// in the parent window and stop (the app itself only starts in a top-level window).
+(function () {
+  if (window.parent !== window && /(^#|&)(access_token|error)=/.test(location.hash)) {
+    try { window.parent.postMessage({ perchOAuth: location.hash }, location.origin); } catch (e) { /* ignore */ }
+    return;
+  }
+  var s = document.createElement('script');
+  s.type = 'module';
+  s.src = 'js/main.js';
+  document.body.appendChild(s);
+})();
+</script>
 
 </body>
 </html>

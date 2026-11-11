@@ -2,7 +2,8 @@
 import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, rubberband, reducedMotion, nextFrame } from './util.js';
 import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
-import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER } from './auth.js';
+import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
+import { extractUrl, saveLink, recentLinks, siteOf } from './inbox.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -33,6 +34,8 @@ const S = {
   swOk: false,
 };
 window.__perch = S; // handy for debugging in devtools
+const SHARE_KEY = 'perch.share';     // a link shared to Perch, kept until it's saved (survives a sign-in redirect)
+const SHARE_TTL = 60 * 60_000;
 
 const el = {
   onboard: $('#onboard'), libs: $('#libs'), syncing: $('#syncing'), main: $('#main'),
@@ -87,6 +90,17 @@ const media = {
     onProgress(1);
     return URL.createObjectURL(new Blob(chunks, { type: res.headers.get('content-type') || '' }));
   },
+  /**
+   * Ask the service worker to keep a neighbouring video ready (whole file, small ones only), so swiping
+   * to it starts at once. Skipped on Data Saver and very slow connections.
+   */
+  prefetch(fileId, size = 0) {
+    if (!S.swOk || !navigator.serviceWorker?.controller || !fileId) return;
+    if (size > 30 * 1024 * 1024) return;
+    const c = navigator.connection;
+    if (c && (c.saveData || /(^|-)2g$/.test(c.effectiveType || ''))) return;
+    fetch(new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI), { headers: { 'X-Perch-Prefetch': '1', 'X-Perch-Size': String(size || 0) } }).catch(() => {});
+  },
   lastError: () => (S.mode === 'drive' && !tokenValid() ? { name: 'AuthError' } : null),
   /** A video failed: was it the token? Asks the service worker's media route for one byte. */
   async authFailed(fileId) {
@@ -109,10 +123,17 @@ const viewer = new Viewer({
   canOpenDrive: () => S.mode === 'drive',
   onTag: (t) => { viewer.close(); setTimeout(() => openSearch({ tags: [t] }), 60); },
   onFolder: (id) => { viewer.close(); setTimeout(() => selectView({ type: 'folder', id }), 60); },
-  // A video hit a 401 mid-use: renew silently and come back to the same frame.
-  onAuthNeeded: (info) => { S.resumeVideo = info; if (S.mode !== 'drive') return false; expireToken(); return renewNow('401'); },
+  // A video hit a 401 mid-use: renew in the background and carry on ('renewed'), or redirect and come
+  // back to the same frame ('redirect').
+  onAuthNeeded: async (info) => {
+    S.resumeVideo = info;
+    if (S.mode !== 'drive') return false;
+    expireToken();
+    if (await renewQuiet('401')) { S.resumeVideo = null; return 'renewed'; }
+    return renewNow('401') ? 'redirect' : false;
+  },
   onReconnect: () => reconnect(),
-  onClosed: () => { if (S.renewWhenIdle) { S.renewWhenIdle = false; renewNow('idle'); } },
+  onClosed: () => { if (S.renewWhenIdle) { S.renewWhenIdle = false; renewSoon('idle'); } },
 });
 
 function openViewer(i, tile) {
@@ -126,6 +147,7 @@ boot().catch((e) => { console.error(e); toast(e.message || 'Something went wrong
 async function boot() {
   const swReady = registerServiceWorker();
   const params = new URLSearchParams(location.search);
+  takeSharedLink(params);
   const red = consumeRedirect();
   if (red && red.ok) {
     lsSet('perch.mode', { mode: 'drive' });
@@ -201,10 +223,14 @@ async function startDemo(mode) {
 async function startDrive(red) {
   S.mode = 'drive';
   S.modeKey = 'drive';
-  S.drive = createDrive({ backend: fetchBackend(), getToken: token, onAuthError: () => onAuthExpired() });
+  S.drive = createDrive({ backend: fetchBackend(), getToken: token, onAuthError: (tok) => onAuthExpired(tok) });
   await swkv.set('mode', { mode: 'drive' });
   setThumbSource(S.drive);
+  // Expired or nearly: renew in the hidden frame first (about a second; the app never leaves the screen).
+  // Only when that can't work does the page redirect below.
+  if (!red && tokenLeft() <= RENEW_AHEAD) await renewQuiet('start', { timeout: 5000 });
   if (tokenValid()) {
+    scheduleRenew();
     await swkv.set('auth', getAuth());
     // Close to expiry at launch: renew now rather than in the middle of a video (never right after a renew).
     if (!red && renewNow('start')) return;
@@ -271,8 +297,9 @@ async function forgetLibraries() {
 }
 
 // ── token renewal ────────────────────────────────────────────────────────────
-// Tokens last an hour. Renew them silently at launch, on resume and after a 401, with the UI state
-// saved first and restored after the redirect, so all the user sees is a short flash.
+// Tokens last an hour. They are renewed in a hidden frame shortly before they expire, at launch, on
+// resume and after a 401, so the app never leaves the screen. Where the frame can't work, a silent page
+// redirect takes over, with the UI state saved first and restored after, so all the user sees is a flash.
 const RESUME_KEY = 'perch.resume';
 const RESUME_TTL = 10 * 60_000;
 
@@ -280,6 +307,43 @@ function videoPlaying() {
   const slot = viewer.isOpen && viewer.cur;
   const v = slot && slot.video;
   return !!(v && !v.paused && !v.ended && !v.error);   // an errored video keeps paused === false
+}
+
+let quietP = null;
+/** Hidden-frame renew. Resolves true once a fresh token is in place (and handed to the service worker). */
+function renewQuiet(reason, { timeout } = {}) {
+  if (S.mode !== 'drive' || S.redirecting || !hasClientId() || !navigator.onLine) return Promise.resolve(false);
+  if (quietP) return quietP;
+  if (!frameRenewAllowed()) return Promise.resolve(false);
+  quietP = renewInFrame({ timeout }).then(async (r) => {
+    if (r.ok) {
+      await swkv.set('auth', getAuth());
+      S.authLost = false;
+      if (S.screen === 'main' && /Reconnect|Refreshing|refresh sign-in/.test(el.notice.textContent || '')) setNotice(null);
+      scheduleRenew();
+      console.info(`[perch] token renewed in the background (${reason})`);
+      return true;
+    }
+    console.info(`[perch] background renew failed (${reason}): ${r.error}`);
+    return false;
+  }).finally(() => { quietP = null; });
+  return quietP;
+}
+
+/** Renew when it's due: quietly if possible, otherwise by the (well-timed) page redirect. */
+async function renewSoon(reason) {
+  if (S.mode !== 'drive' || S.redirecting || tokenLeft() > RENEW_AHEAD) return;
+  if (await renewQuiet(reason)) return;
+  renewNow(reason);
+}
+
+let renewTimer = 0;
+/** Renew in the background a little before the token runs out, so it never expires mid-video. */
+function scheduleRenew() {
+  clearTimeout(renewTimer);
+  if (S.mode !== 'drive' || !getAuth()) return;
+  const wait = Math.max(5_000, tokenLeft() - RENEW_AHEAD + 1_000);
+  renewTimer = setTimeout(() => { if (!document.hidden) renewQuiet('timer'); }, Math.min(wait, 2 ** 31 - 1));
 }
 
 /** Redirects for a silent renew when it's needed and allowed. Returns true when a redirect started. */
@@ -295,19 +359,34 @@ function renewNow(reason) {
   return true;
 }
 
-/** Drive said 401. Renew silently; the Reconnect pill is only the fallback. */
-function onAuthExpired() {
-  if (S.mode !== 'drive' || S.redirecting) return;
+/**
+ * Drive said 401 for `tokUsed`. Renew in the background and report true so the request is retried;
+ * otherwise fall back to the redirect, and the Reconnect pill as the last resort.
+ */
+async function onAuthExpired(tokUsed) {
+  if (S.mode !== 'drive' || S.redirecting) return false;
+  if (tokUsed && token() && token() !== tokUsed && tokenValid()) return true;   // already renewed meanwhile
   expireToken();
-  if (renewNow('401') || S.renewWhenIdle) return;
+  if (await renewQuiet('401')) return true;
+  if (renewNow('401') || S.renewWhenIdle) return false;
   if (navigator.onLine) onAuthLost();
   else setNotice('Offline · saved library');
+  return false;
+}
+
+/** After a background renew, a failed step may run once more — not again within 30 s (no loops). */
+function mayRetryAuth() {
+  const now = Date.now();
+  if (now - (S.authRetryAt || 0) < 30_000) return false;
+  S.authRetryAt = now;
+  return true;
 }
 
 function onResume() {
   if (document.hidden || S.mode !== 'drive' || S.redirecting) return;
   if (S.renewWhenIdle && !videoPlaying()) S.renewWhenIdle = false;
-  renewNow('resume');
+  scheduleRenew();
+  renewSoon('resume');
 }
 
 /** Interactive sign-in (with login_hint), UI state saved like any renew. */
@@ -379,6 +458,7 @@ function showScreen(name) {
   else {
     requestAnimationFrame(() => { measureHero(); grid.measureTop(); grid.render(); onScroll(); });
     if (S.model) maybeShowInstallCard();
+    setTimeout(handleSharedLink, 0);
   }
 }
 
@@ -577,7 +657,11 @@ async function runSync({ first = false, full = false, background = false } = {})
     else setNotice(null);
   } catch (e) {
     if (!current()) return;
-    if (e.name === 'AuthError') { onAuthExpired(); if (first && !S.redirecting) showOnboarding(); return; }
+    if (e.name === 'AuthError') {
+      if (await onAuthExpired()) { if (mayRetryAuth()) setTimeout(() => runSync({ first, full, background }), 0); return; }   // renewed: go again
+      if (first && !S.redirecting) showOnboarding();
+      return;
+    }
     console.warn('[perch] sync failed', e);
     if (first) showSyncError(e);
     else setNotice(navigator.onLine ? 'Couldn’t sync · Retry' : 'Offline · saved library', () => runSync());
@@ -601,7 +685,7 @@ function showSyncError(e) {
 }
 
 function handleFatal(e) {
-  if (e.name === 'AuthError') { onAuthExpired(); if (!S.redirecting) showOnboarding(); return; }
+  if (e.name === 'AuthError') { onAuthExpired().then((ok) => { if (ok) { if (mayRetryAuth()) showLibraries(); } else if (!S.redirecting) showOnboarding(); }); return; }
   el.libsSub.textContent = e.message || 'Something went wrong';
 }
 
@@ -857,6 +941,8 @@ function openMore() {
         h('span', { class: 'ico', html: I.columns }), h('span', { class: 'label' }, 'Columns'), seg),
       h('button', { class: 'row', type: 'button', onclick: () => { sheet.close(); runSync(); } },
         h('span', { class: 'ico', html: I.sync }), h('span', { class: 'label' }, 'Sync now'), syncMeta),
+      h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openSaveLink(); } },
+        h('span', { class: 'ico', html: I.inbox }), h('span', { class: 'label' }, 'Save a link to Eagle'), h('span', { class: 'ico', html: I.chevronR })),
       canInstall() ? h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openInstallSheet(); } },
         h('span', { class: 'ico', html: I.plusSquare }), h('span', { class: 'label' }, 'Install app')) : null,
       h('div', { class: 'sep' }),
@@ -864,7 +950,7 @@ function openMore() {
         ? h('button', { class: 'row', type: 'button', onclick: exitDemo }, h('span', { class: 'ico', html: I.signout }), h('span', { class: 'label' }, 'Exit demo'))
         : h('button', { class: 'row danger', type: 'button', onclick: confirmSignOut }, h('span', { class: 'ico', html: I.signout }), h('span', { class: 'label' }, 'Sign out')),
       h('div', { class: 'foot-note' },
-        S.mode === 'demo' ? 'Demo library · ' : 'Google Drive · read-only · ',
+        S.mode === 'demo' ? 'Demo library · ' : canWrite() ? 'Google Drive · ' : 'Google Drive · read-only · ',
         h('button', { type: 'button', style: { textDecoration: 'underline', color: 'inherit', fontSize: 'inherit' }, onclick: () => { sheet.close(); runSync({ full: true }); } }, 'Rebuild cache')),
     ],
   });
@@ -883,6 +969,115 @@ async function openLibrarySwitcher() {
   if (!S.libs.length) {
     try { S.libs = withPasted(await discoverLibraries(S.drive)); sheet.setBody(body()); } catch (e) { sheet.setBody(h('div', { class: 'group-label' }, e.message)); }
   }
+}
+
+// ── save links to Eagle ──────────────────────────────────────────────────────
+// Share a video page to Perch (Android share sheet), or paste its link: Perch drops it in the Drive inbox
+// and Video Grabber in Eagle downloads it the next time Eagle is open on the computer.
+
+/** The share sheet opened Perch with ?share_url / share_text / share_title: keep the link, tidy the address. */
+function takeSharedLink(params) {
+  const keys = ['share_url', 'share_text', 'share_title'];
+  if (!keys.some((k) => params.has(k))) return;
+  const url = extractUrl(...keys.map((k) => params.get(k)));
+  for (const k of keys) params.delete(k);
+  const rest = params.toString();
+  history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash);
+  if (url) lsSet(SHARE_KEY, { url, t: Date.now() });
+  else setTimeout(() => toast('There was no link in what you shared'), 500);
+}
+
+function handleSharedLink() {
+  const p = lsGet(SHARE_KEY);
+  if (!p || S.screen !== 'main' || S.redirecting || S.shareOpen) return;
+  if (Date.now() - p.t > SHARE_TTL) { lsSet(SHARE_KEY, null); return; }
+  openSaveLink({ url: p.url, auto: true });
+}
+
+const LINK_STATUS = {
+  pending: 'Waiting for Eagle',
+  queued: 'Downloading…',
+  downloading: 'Downloading…',
+  done: 'Added to Eagle',
+  error: 'Couldn’t download',
+};
+
+function openSaveLink({ url = '', auto = false } = {}) {
+  const writable = S.mode === 'demo' || canWrite();
+  const libName = (S.lib?.name || '').replace(/\.library$/i, '');
+  const input = h('input', { class: 'field', type: 'url', placeholder: 'Paste a video link', value: url, autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
+  const err = h('div', { class: 'err' });
+  const saveBtn = h('button', { class: 'btn-primary', type: 'button' }, writable ? 'Save to Eagle' : 'Allow & save');
+  const recent = h('div', { class: 'link-list' });
+  const done = h('div', { class: 'link-done', hidden: true });
+
+  async function save() {
+    err.textContent = '';
+    const link = extractUrl(input.value);
+    if (!link) { err.textContent = 'That doesn’t look like a link.'; return; }
+    if (!writable) {
+      // First time: Google asks once to let Perch create files (it only ever sees files it made).
+      lsSet(SHARE_KEY, { url: link, t: Date.now() });
+      saveUiState();
+      S.redirecting = true;
+      signIn({ write: true });
+      return;
+    }
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving…';
+    try {
+      await saveLink(S.drive, S.modeKey, { url: link, library: S.lib });
+      lsSet(SHARE_KEY, null);
+      input.value = '';
+      form.hidden = true;
+      done.hidden = false;
+      done.replaceChildren(h('span', { class: 'ico', html: I.check }),
+        h('div', null, h('div', { class: 'link-done-title' }, 'Saved'),
+          h('div', { class: 'link-done-sub' }, `It downloads into ${libName ? `“${libName}”` : 'Eagle'} the next time Eagle is open on your computer.`)));
+      loadRecent();
+    } catch (e) {
+      const scope = e.name === 'DriveError' && e.status === 403 && /insufficient|scope|permission/i.test(e.message);
+      if (scope) { lsSet(SHARE_KEY, { url: link, t: Date.now() }); saveUiState(); S.redirecting = true; signIn({ write: true }); return; }
+      err.textContent = e.name === 'AuthError' ? 'Google sign-in expired — try again.' : (e.message || 'Couldn’t save the link');
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Save to Eagle';
+    }
+  }
+
+  async function loadRecent() {
+    try {
+      const rows = await recentLinks(S.drive, S.modeKey);
+      if (!rows.length) { recent.replaceChildren(); return; }
+      recent.replaceChildren(h('div', { class: 'group-label' }, 'Recent'), ...rows.map((r) => h('div', { class: `link-row ${r.status || ''}` },
+        h('span', { class: 'link-dot' }),
+        h('div', { class: 'link-text' },
+          h('div', { class: 'link-title', dir: 'auto' }, r.status === 'done' && r.title ? r.title : siteOf(r.url || '')),
+          h('div', { class: 'link-meta' }, [LINK_STATUS[r.status] || 'Waiting for Eagle', r.status === 'error' && r.error ? ` · ${String(r.error).slice(0, 80)}` : '', r.sentAt ? ` · ${timeAgo(Date.parse(r.sentAt))}` : ''].join(''))))));
+      // Something landed in Eagle since the last sync: fetch it.
+      if (S.snap && rows.some((r) => r.status === 'done' && Date.parse(r.doneAt || 0) > S.snap.lastSync)) runSync({ background: true });
+    } catch { /* the list is a nicety */ }
+  }
+
+  saveBtn.addEventListener('click', save);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+  const paste = navigator.clipboard && navigator.clipboard.readText
+    ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) input.value = u; else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
+    : null;
+  const form = h('div', { class: 'form' },
+    h('div', { class: 'field-row' }, input, paste), err,
+    writable ? null : h('p', { class: 'link-note' }, 'Google will ask once to let Perch save links to your Drive. Perch can only see the files it saves.'),
+    saveBtn);
+  S.shareOpen = true;
+  openSheet({
+    title: 'Save to Eagle',
+    sub: 'Video Grabber downloads it on your computer.',
+    body: [done, form, recent],
+    onClose: () => { S.shareOpen = false; },
+  });
+  if (auto && writable) save();
+  else if (!url) setTimeout(() => input.focus(), 350);
+  if (S.drive) loadRecent();
 }
 
 function confirmSignOut() {
