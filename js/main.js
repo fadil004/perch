@@ -1,9 +1,10 @@
 // Perch — boot, screens, sync orchestration, folders/search/more sheets.
-import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, rubberband, reducedMotion, nextFrame } from './util.js';
+import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, fmtBytes, rubberband, reducedMotion, nextFrame } from './util.js';
 import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
 import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
 import { extractUrl, saveLink, recentLinks, siteOf } from './inbox.js';
+import { createUploader, stash } from './uploads.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -36,6 +37,8 @@ const S = {
 window.__perch = S; // handy for debugging in devtools
 const SHARE_KEY = 'perch.share';     // a link shared to Perch, kept until it's saved (survives a sign-in redirect)
 const SHARE_TTL = 60 * 60_000;
+const SHARE_FILES_KEY = 'perch.share.files';   // videos just shared to Perch: show them uploading once the app is ready
+let uploader = null;                           // see up()
 
 const el = {
   onboard: $('#onboard'), libs: $('#libs'), syncing: $('#syncing'), main: $('#main'),
@@ -942,7 +945,7 @@ function openMore() {
       h('button', { class: 'row', type: 'button', onclick: () => { sheet.close(); runSync(); } },
         h('span', { class: 'ico', html: I.sync }), h('span', { class: 'label' }, 'Sync now'), syncMeta),
       h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openSaveLink(); } },
-        h('span', { class: 'ico', html: I.inbox }), h('span', { class: 'label' }, 'Save a link to Eagle'), h('span', { class: 'ico', html: I.chevronR })),
+        h('span', { class: 'ico', html: I.inbox }), h('span', { class: 'label' }, 'Save to Eagle'), h('span', { class: 'ico', html: I.chevronR })),
       canInstall() ? h('button', { class: 'row', type: 'button', onclick: async () => { await sheet.close(); openInstallSheet(); } },
         h('span', { class: 'ico', html: I.plusSquare }), h('span', { class: 'label' }, 'Install app')) : null,
       h('div', { class: 'sep' }),
@@ -971,25 +974,62 @@ async function openLibrarySwitcher() {
   }
 }
 
-// ── save links to Eagle ──────────────────────────────────────────────────────
-// Share a video page to Perch (Android share sheet), or paste its link: Perch drops it in the Drive inbox
-// and Video Grabber in Eagle downloads it the next time Eagle is open on the computer.
+// ── send to Eagle ────────────────────────────────────────────────────────────
+// Both ways go through the Drive inbox that Video Grabber (in Eagle on the computer) reads:
+// • a video the phone already has (shared from a downloader app such as YTDLnis, or picked here): Perch
+//   uploads it, and Eagle only has to add it when it opens — the computer downloads nothing;
+// • a link: Video Grabber downloads it the next time Eagle is open.
 
-/** The share sheet opened Perch with ?share_url / share_text / share_title: keep the link, tidy the address. */
+const canSend = () => S.mode === 'demo' || (S.mode === 'drive' && canWrite());
+const uploadListeners = new Set();
+
+/** The upload queue (created on first use: boot runs before this part of the module). */
+function up() {
+  if (!uploader) {
+    uploader = createUploader({
+      ctx: () => ({ drive: S.drive, modeKey: S.modeKey, library: S.lib, writable: canSend() }),
+      onChange: (items) => { for (const fn of uploadListeners) fn(items); },
+      onSaved: (it) => { if (!S.shareOpen) toast('Sent to Eagle', it.name ? ` · ${it.name}` : ''); },
+    });
+    S.uploader = uploader;   // for devtools
+  }
+  return uploader;
+}
+
+/** First upload: Google asks once to let Perch create files (it only ever sees files it made). */
+function askWrite() {
+  lsSet(SHARE_FILES_KEY, Date.now());
+  saveUiState();
+  S.redirecting = true;
+  signIn({ write: true });
+}
+
+/** The share sheet opened Perch: a link (?share_url / share_text / share_title) or files (?shared=n, kept by the service worker). */
 function takeSharedLink(params) {
   const keys = ['share_url', 'share_text', 'share_title'];
-  if (!keys.some((k) => params.has(k))) return;
+  if (![...keys, 'shared'].some((k) => params.has(k))) return;
+  const shared = params.get('shared');
   const url = extractUrl(...keys.map((k) => params.get(k)));
-  for (const k of keys) params.delete(k);
+  for (const k of [...keys, 'shared']) params.delete(k);
   const rest = params.toString();
   history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash);
-  if (url) lsSet(SHARE_KEY, { url, t: Date.now() });
+  if (shared === 'failed') setTimeout(() => toast('Couldn’t receive what you shared'), 500);
+  else if (shared && shared !== 'empty') lsSet(SHARE_FILES_KEY, Date.now());
+  else if (url) lsSet(SHARE_KEY, { url, t: Date.now() });
   else setTimeout(() => toast('There was no link in what you shared'), 500);
 }
 
 function handleSharedLink() {
+  if (S.screen !== 'main' || S.redirecting) return;
+  if (canSend()) up().run();
+  if (S.shareOpen) return;
+  const files = lsGet(SHARE_FILES_KEY);
+  if (files) {
+    lsSet(SHARE_FILES_KEY, null);
+    if (Date.now() - files < SHARE_TTL) { openSaveLink(); return; }
+  }
   const p = lsGet(SHARE_KEY);
-  if (!p || S.screen !== 'main' || S.redirecting || S.shareOpen) return;
+  if (!p) return;
   if (Date.now() - p.t > SHARE_TTL) { lsSet(SHARE_KEY, null); return; }
   openSaveLink({ url: p.url, auto: true });
 }
@@ -1001,16 +1041,61 @@ const LINK_STATUS = {
   done: 'Added to Eagle',
   error: 'Couldn’t download',
 };
+const FILE_STATUS = { ...LINK_STATUS, queued: 'Adding to Eagle…', downloading: 'Adding to Eagle…', error: 'Couldn’t add' };
 
 function openSaveLink({ url = '', auto = false } = {}) {
-  const writable = S.mode === 'demo' || canWrite();
+  const writable = canSend();
   const libName = (S.lib?.name || '').replace(/\.library$/i, '');
   const input = h('input', { class: 'field', type: 'url', placeholder: 'Paste a video link', value: url, autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
   const err = h('div', { class: 'err' });
-  const saveBtn = h('button', { class: 'btn-primary', type: 'button' }, writable ? 'Save to Eagle' : 'Allow & save');
+  const saveBtn = h('button', { class: 'btn-primary', type: 'button' }, writable ? 'Save link' : 'Allow & save');
   const recent = h('div', { class: 'link-list' });
   const done = h('div', { class: 'link-done', hidden: true });
+  const uploads = h('div', { class: 'link-list' });
 
+  // ── a video already on the phone
+  const picker = h('input', { type: 'file', accept: 'video/*,image/*', multiple: true, hidden: true });
+  const upBtn = h('button', { class: 'btn-fill', type: 'button', onclick: () => {
+    if (canSend() || !up().list().some((it) => it.status !== 'saved')) picker.click();
+    else askWrite();
+  } }, h('span', { class: 'ico', html: I.inbox }), 'Upload a video from this phone');
+  picker.addEventListener('change', async () => {
+    const files = [...picker.files];
+    picker.value = '';
+    if (!files.length) return;
+    try { await stash(files); } catch (e) { toast('Couldn’t read that file'); return; }
+    if (canSend()) up().run(); else askWrite();
+  });
+
+  let lastSaved = 0;
+  let frame = 0;
+  const pct = (it) => (it.size ? Math.floor((100 * it.sent) / it.size) : 0);
+  const upText = (it) => ({
+    waiting: `Waiting · ${fmtBytes(it.size)}`,
+    uploading: it.sent ? `Uploading ${pct(it)}% · ${fmtBytes(it.sent)} of ${fmtBytes(it.size)}` : `Uploading · ${fmtBytes(it.size)}`,
+    error: `Couldn’t upload · ${it.error}`,
+  }[it.status] || '');
+  function renderUploads(items) {
+    const saved = items.filter((it) => it.status === 'saved').length;
+    if (saved > lastSaved) { lastSaved = saved; loadRecent(); }
+    const open = items.filter((it) => it.status !== 'saved');
+    if (!open.length) { uploads.replaceChildren(); upBtn.lastChild.textContent = 'Upload a video from this phone'; return; }
+    const blocked = !canSend();
+    upBtn.lastChild.textContent = blocked ? 'Allow & upload' : 'Upload another video';
+    uploads.replaceChildren(
+      h('div', { class: 'group-label' }, 'Uploading to Drive'),
+      ...open.map((it) => h('div', { class: `link-row ${it.status}` },
+        h('span', { class: 'link-dot' }),
+        h('div', { class: 'link-text' },
+          h('div', { class: 'link-title', dir: 'auto' }, it.name || 'Video'),
+          h('div', { class: 'link-meta' }, blocked && it.status === 'waiting' ? 'Waiting for Google’s OK' : upText(it)),
+          it.status === 'uploading' ? h('div', { class: 'up-bar' }, h('i', { style: { width: `${pct(it)}%` } })) : null),
+        it.status === 'error' ? h('button', { class: 'link-retry', type: 'button', onclick: () => (it.scope || !canSend() ? askWrite() : up().retry()) }, 'Retry') : null)),
+      open.some((it) => it.status === 'uploading') ? h('p', { class: 'link-note up-note' }, 'Keep Perch open until it finishes. If it closes, the upload carries on next time.') : null);
+  }
+  const onUploads = (items) => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => renderUploads(items)); };
+
+  // ── a link (Video Grabber downloads it)
   async function save() {
     err.textContent = '';
     const link = extractUrl(input.value);
@@ -1029,7 +1114,6 @@ function openSaveLink({ url = '', auto = false } = {}) {
       await saveLink(S.drive, S.modeKey, { url: link, library: S.lib });
       lsSet(SHARE_KEY, null);
       input.value = '';
-      form.hidden = true;
       done.hidden = false;
       done.replaceChildren(h('span', { class: 'ico', html: I.check }),
         h('div', null, h('div', { class: 'link-done-title' }, 'Saved'),
@@ -1041,7 +1125,7 @@ function openSaveLink({ url = '', auto = false } = {}) {
       err.textContent = e.name === 'AuthError' ? 'Google sign-in expired — try again.' : (e.message || 'Couldn’t save the link');
     } finally {
       saveBtn.disabled = false;
-      saveBtn.textContent = 'Save to Eagle';
+      saveBtn.textContent = 'Save link';
     }
   }
 
@@ -1049,11 +1133,15 @@ function openSaveLink({ url = '', auto = false } = {}) {
     try {
       const rows = await recentLinks(S.drive, S.modeKey);
       if (!rows.length) { recent.replaceChildren(); return; }
-      recent.replaceChildren(h('div', { class: 'group-label' }, 'Recent'), ...rows.map((r) => h('div', { class: `link-row ${r.status || ''}` },
-        h('span', { class: 'link-dot' }),
-        h('div', { class: 'link-text' },
-          h('div', { class: 'link-title', dir: 'auto' }, r.status === 'done' && r.title ? r.title : siteOf(r.url || '')),
-          h('div', { class: 'link-meta' }, [LINK_STATUS[r.status] || 'Waiting for Eagle', r.status === 'error' && r.error ? ` · ${String(r.error).slice(0, 80)}` : '', r.sentAt ? ` · ${timeAgo(Date.parse(r.sentAt))}` : ''].join(''))))));
+      recent.replaceChildren(h('div', { class: 'group-label' }, 'Recent'), ...rows.map((r) => {
+        const file = r.kind === 'file';
+        const status = (file ? FILE_STATUS : LINK_STATUS)[r.status] || 'Waiting for Eagle';
+        return h('div', { class: `link-row ${r.status || ''}` },
+          h('span', { class: 'link-dot' }),
+          h('div', { class: 'link-text' },
+            h('div', { class: 'link-title', dir: 'auto' }, r.status === 'done' && r.title ? r.title : file ? (r.name || 'Video') : siteOf(r.url || '')),
+            h('div', { class: 'link-meta' }, [status, r.status === 'error' && r.error ? ` · ${String(r.error).slice(0, 80)}` : '', r.sentAt ? ` · ${timeAgo(Date.parse(r.sentAt))}` : ''].join(''))));
+      }));
       // Something landed in Eagle since the last sync: fetch it.
       if (S.snap && rows.some((r) => r.status === 'done' && Date.parse(r.doneAt || 0) > S.snap.lastSync)) runSync({ background: true });
     } catch { /* the list is a nicety */ }
@@ -1064,19 +1152,24 @@ function openSaveLink({ url = '', auto = false } = {}) {
   const paste = navigator.clipboard && navigator.clipboard.readText
     ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) input.value = u; else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
     : null;
+  const phone = h('div', { class: 'form' },
+    upBtn, picker,
+    h('p', { class: 'link-note' }, `Already downloaded? Eagle adds it to ${libName ? `“${libName}”` : 'the library'} as soon as it opens — your computer downloads nothing.`));
   const form = h('div', { class: 'form' },
+    h('div', { class: 'group-label flush' }, 'Or a link'),
     h('div', { class: 'field-row' }, input, paste), err,
-    writable ? null : h('p', { class: 'link-note' }, 'Google will ask once to let Perch save links to your Drive. Perch can only see the files it saves.'),
+    h('p', { class: 'link-note' }, 'Video Grabber downloads it when Eagle is open on your computer.'),
     saveBtn);
   S.shareOpen = true;
+  uploadListeners.add(onUploads);
   openSheet({
     title: 'Save to Eagle',
-    sub: 'Video Grabber downloads it on your computer.',
-    body: [done, form, recent],
-    onClose: () => { S.shareOpen = false; },
+    sub: writable ? (libName ? `Into “${libName}”` : '') : 'Google will ask once to let Perch save to your Drive. Perch can only see the files it saves.',
+    body: [uploads, phone, done, form, recent],
+    onClose: () => { S.shareOpen = false; uploadListeners.delete(onUploads); cancelAnimationFrame(frame); up().clearSaved(); },
   });
+  up().refresh();
   if (auto && writable) save();
-  else if (!url) setTimeout(() => input.focus(), 350);
   if (S.drive) loadRecent();
 }
 
@@ -1205,8 +1298,10 @@ function toast(a, b) {
 }
 
 addEventListener('pageshow', (e) => { if (e.persisted) onResume(); });
+addEventListener('online', () => { if (S.screen === 'main' && canSend()) up().retry(); });
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) onResume();
+  if (!document.hidden && S.screen === 'main' && !S.redirecting && canSend()) up().run();   // uploads left from last time
   if (document.hidden || S.redirecting || S.screen !== 'main' || !S.snap) return;
   if (Date.now() - S.snap.lastSync > 5 * 60_000 && (S.mode === 'demo' || tokenValid())) runSync({ background: true });
 });

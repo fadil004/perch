@@ -7,15 +7,18 @@
 // 3. Keeps small videos (≤ 30 MB) whole in a media cache (LRU, 600 MB): the first play streams and fills
 //    the cache at the same time, replays and seeks then come from the phone, and the viewer asks for the
 //    next and previous videos ahead of time (X-Perch-Prefetch) so swiping to them starts at once.
+// 4. Share target: a video shared from another app (POST ./share-target) is kept in the 'perch-share' cache
+//    and the app opens to upload it to Drive; a shared link goes on to the app as ?share_url=….
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v8';
+const VERSION = 'perch-v9';
 const MEDIA_CACHE = 'perch-media';
 const MEDIA_MAX_FILE = 30 * 1024 * 1024;
 const MEDIA_BUDGET = 600 * 1024 * 1024;
+const SHARE_CACHE = 'perch-share';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './config.js', './css/app.css',
   './js/main.js', './js/util.js', './js/icons.js', './js/store.js', './js/auth.js', './js/drive.js',
-  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js', './js/framestep.js', './js/inbox.js',
+  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js', './js/framestep.js', './js/inbox.js', './js/uploads.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',
 ];
 const DRIVE = 'https://www.googleapis.com/drive/v3/files/';
@@ -45,6 +48,7 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== SCOPE.origin || !url.pathname.startsWith(SCOPE.pathname)) return;
   const rel = url.pathname.slice(SCOPE.pathname.length);
   if (rel.startsWith('media/')) { event.respondWith(media(event, req, decodeURIComponent(rel.slice(6)))); return; }
+  if (req.method === 'POST' && rel === 'share-target') { event.respondWith(receiveShare(req)); return; }
   if (req.method !== 'GET' || rel.startsWith('demo/') || rel.startsWith('__')) return;
   if (req.mode === 'navigate') {
     // Only the app itself; opening e.g. a screenshot in a tab goes straight to the network.
@@ -55,6 +59,38 @@ self.addEventListener('fetch', (event) => {
   // On localhost always serve fresh files; elsewhere answer from cache and refresh it in the background.
   event.respondWith(DEV ? networkFirst(req, { timeout: 0 }) : staleWhileRevalidate(event, req));
 });
+
+/** Something was shared to Perch from another app. Files wait in the share cache; links go on as before. */
+async function receiveShare(req) {
+  const back = new URL('./', SCOPE);
+  try {
+    const form = await req.formData();
+    const text = ['share_url', 'share_text', 'share_title'].map((k) => [k, String(form.get(k) || '')]).filter(([, v]) => v);
+    const files = form.getAll('file').filter((f) => f && typeof f === 'object' && f.size > 0);
+    if (files.length) {
+      const link = (text.map(([, v]) => v).join(' ').match(/https?:\/\/[^\s<>"']+/i) || [''])[0];
+      const cache = await caches.open(SHARE_CACHE);
+      const t = Date.now();
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        const id = `${t + i}-${Math.random().toString(36).slice(2, 8).padEnd(6, '0')}`;
+        await cache.put(new URL(`__share/${id}`, SCOPE).href, new Response(f, { headers: {
+          'content-type': f.type || 'application/octet-stream',
+          'x-name': encodeURIComponent(f.name || ''),
+          'x-size': String(f.size),
+          'x-url': encodeURIComponent(link),
+        } }));
+      }
+      back.searchParams.set('shared', String(files.length));
+    } else {
+      for (const [k, v] of text) back.searchParams.set(k, v);
+      if (!text.length) back.searchParams.set('shared', 'empty');
+    }
+  } catch (e) {
+    back.searchParams.set('shared', 'failed');
+  }
+  return Response.redirect(back.href, 303);
+}
 
 /** Network first; after `timeout` ms (or on failure) fall back to the cached copy. */
 async function networkFirst(req, { key = req, navigate = false, timeout = NET_TIMEOUT } = {}) {

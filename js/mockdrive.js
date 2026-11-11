@@ -200,8 +200,16 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
   };
 
   let created = 0;
-  async function backend({ path, params, method = 'GET', meta, content }) {
+  const sessions = new Map();   // resumable uploads in progress: session URL -> { meta, size, got }
+  async function backend({ path, params, method = 'GET', meta, content, size }) {
     await sleep(latency * (0.6 + Math.random() * 0.8));
+    if (method === 'POST' && path === 'files' && meta && params.uploadType === 'resumable') {
+      const missing = (meta.parents || []).find((pid) => pid !== 'root' && !files.has(pid));
+      if (missing) return fail(404, `File not found: ${missing}.`);
+      const url = `${location.origin}/__mock-upload/${++created}`;
+      sessions.set(url, { meta, size: Number(size) || 0, got: 0 });
+      return new Response('', { status: 200, headers: { Location: url } });
+    }
     if (method === 'POST' && path === 'files' && meta) {
       // files.create: folders and small uploads (the link inbox) live in memory for the session.
       const missing = (meta.parents || []).find((pid) => pid !== 'root' && !files.has(pid));
@@ -238,6 +246,30 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     }
     return fail(404, 'Unknown endpoint');
   }
+
+  /** Upload bytes to a resumable session (stands in for the XHR PUT). Sends in slices so progress moves. */
+  backend.put = async ({ url, headers, body, onProgress }) => {
+    const res = (status, extra = {}, text = '') => ({ status, header: (n) => extra[n] ?? null, text });
+    const s = sessions.get(url);
+    if (!s) return res(404);
+    const range = headers['Content-Range'] || '';
+    if (/^bytes \*\//.test(range)) return s.file ? res(200, {}, JSON.stringify(s.file)) : res(308, s.got ? { Range: `bytes=0-${s.got - 1}` } : {});
+    const m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
+    if (!m || Number(m[1]) !== s.got) return res(400);
+    const n = body ? body.size : 0;
+    for (let sent = 0; sent < n; ) {
+      await sleep(40);
+      sent = Math.min(n, sent + Math.max(256 * 1024, n / 12));
+      onProgress && onProgress(sent);
+    }
+    s.got += n;
+    if (s.got < Number(m[3])) return res(308, { Range: `bytes=0-${s.got - 1}` });
+    const now = new Date().toISOString();
+    const f = { id: `new-${++created}-${Date.now().toString(36)}`, name: s.meta.name, mimeType: s.meta.mimeType, parents: s.meta.parents || ['root'], size: String(s.got), createdTime: now, modifiedTime: now, trashed: false };
+    add(f);
+    s.file = strip(f);
+    return res(200, {}, JSON.stringify(s.file));
+  };
 
   /** fileId -> absolute URL, for the service worker's ./media/<id> route. */
   function mediaMap() {

@@ -65,6 +65,7 @@ export async function wipeAll() {
   });
   try { await caches.delete('perch-kv'); } catch { /* ignore */ }
   try { await caches.delete('perch-media'); } catch { /* ignore */ }   // videos kept by the service worker
+  try { await caches.delete('perch-share'); } catch { /* ignore */ }   // shared videos not uploaded yet
 }
 
 // Small JSON values shared with the service worker (it can't see localStorage).

@@ -11,7 +11,8 @@ Live at GitHub Pages (`main` branch, repo root). Google Cloud only holds the OAu
 - `js/main.js` boot, screens, sync, sheets, token renewal, Save to Eagle
 - `js/auth.js` OAuth implicit flow: redirect sign-in, hidden-frame silent renew, `drive.file` opt-in
 - `js/drive.js` Drive v3 client (reads, folder/file create, 401 self-heal); `js/mockdrive.js` demo stand-in
-- `js/inbox.js` link inbox (My Drive / Perch Inbox)
+- `js/inbox.js` the inbox (My Drive / Perch Inbox): link and file requests
+- `js/uploads.js` videos sent from the phone: kept in the `perch-share` cache, resumable upload to the inbox
 - `js/viewer.js` full-screen viewer (video, frame step, rotate); `js/grid.js` the grid
 - `sw.js` shell cache, Drive media streaming with Range, media cache + prefetch. **Bump `VERSION` on every deploy.**
 
@@ -32,6 +33,25 @@ Run locally: `python3 tools/serve.py 8780`, open `http://localhost:8780/?demo=1`
    Each link becomes `My Drive/Perch Inbox/<13-digit ms>-<id>.json`:
    `{ v: 1, url, library, sentAt, from: "Perch", status: "pending" }`.
    The plugin writes back `status` (`queued` | `downloading` | `done` | `error`), `by`, `title`, `error`, `doneAt`.
+
+## v9
+
+**Phone downloads, no computer download.** A web app can't fetch videos from Instagram/TikTok/YouTube
+itself (CORS, and those sites need yt-dlp), so the phone downloads with an Android yt-dlp app
+(YTDLnis recommended) and shares the file to Perch.
+- `manifest.webmanifest` share target is now `POST multipart/form-data` to `./share-target` with
+  `files` (video/*, image/*) plus the old title/text/url params. `sw.js` `receiveShare()` keeps files in
+  the `perch-share` cache and redirects to `./?shared=n`; a link alone redirects to `./?share_url=…` (old flow).
+- `js/uploads.js` uploads one file at a time: Drive resumable session (`drive.startUpload` /
+  `drive.sendUpload`, XHR for progress; probes with `bytes */N` and resumes; a 400 after the browser
+  resends a cut PUT triggers a probe; 404/410 → new session). Session URL kept in `perch.up.<id>`.
+- Inbox gets `<stem>.<ext>` (the video) + `<stem>.json`
+  `{ v: 1, kind: "file", file, name, size, mimeType, url, library, sentAt, from, status: "pending" }`.
+- Plugin 1.3.0 (`perch-inbox.js` `importUpload`): waits until the synced file has the full size, copies
+  it to a temp folder, `eagle.item.addFromPath` (tag `perch`, website = source link if shared with one),
+  deletes the inbox video, marks the request done. 3 tries, then `error`.
+- Tested: headless Brave (share POST, picker, reload mid-upload, dropped connection against a fake
+  Google endpoint) and a Node test of the plugin. **Not yet on the real phone, real Drive, or real Eagle.**
 
 ## Video Grabber plugin (Eagle) — not in this repo
 

@@ -24,6 +24,24 @@ export function fetchBackend() {
     });
 }
 
+/** PUT with upload progress (fetch can't report it). Resolves with { status, header(name), text }. */
+function xhrPut({ url, headers = {}, body = null, signal, onProgress }) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', url);
+    for (const [k, v] of Object.entries(headers)) x.setRequestHeader(k, v);
+    if (onProgress) x.upload.onprogress = (e) => onProgress(e.loaded);
+    x.onload = () => resolve({ status: x.status, header: (n) => x.getResponseHeader(n), text: x.responseText });
+    x.onerror = x.ontimeout = () => reject(new TypeError('Network error'));
+    x.onabort = () => reject(new DOMException('Upload stopped', 'AbortError'));
+    if (signal) {
+      if (signal.aborted) { reject(new DOMException('Upload stopped', 'AbortError')); return; }
+      signal.addEventListener('abort', () => x.abort(), { once: true });
+    }
+    x.send(body);
+  });
+}
+
 /**
  * onAuthError(tokenUsed) is called on a 401 and may return (a promise of) true once a fresh token is in
  * place: the request is then sent once more, so a token that expired mid-use heals without a hiccup.
@@ -117,6 +135,73 @@ export function createDrive({ backend, getToken = () => null, onAuthError = () =
       return (await request('files', { uploadType: 'multipart', fields, supportsAllDrives: 'true' }, {
         method: 'POST', upload: true, body, headers: { 'Content-Type': `multipart/related; boundary=${boundary}` }, meta, content,
       })).json();
+    },
+    /** Resumable upload, step 1: open an upload session. Resolves with its URL (Drive keeps it for a week). */
+    async startUpload(name, parents, { mimeType = 'application/octet-stream', size } = {}) {
+      const meta = { name, mimeType, ...(parents.length ? { parents } : {}) };
+      const res = await request('files', { uploadType: 'resumable', fields: 'id,name,size', supportsAllDrives: 'true' }, {
+        method: 'POST', upload: true, body: JSON.stringify(meta), meta, size,
+        headers: { 'Content-Type': 'application/json; charset=UTF-8', 'X-Upload-Content-Type': mimeType, ...(size != null ? { 'X-Upload-Content-Length': String(size) } : {}) },
+      });
+      const session = res.headers.get('Location');
+      if (!session) throw new DriveError(0, 'The upload could not start');
+      return session;
+    },
+    /**
+     * Step 2: send the bytes. Picks up where Drive stopped (a session from an earlier visit may already hold
+     * part of the file), retries dropped connections, and resolves with the created file.
+     * A session Drive no longer knows rejects with DriveError status 410: start a new one.
+     */
+    async sendUpload(session, blob, { onProgress = () => {}, signal, fresh = false } = {}) {
+      const total = blob.size;
+      const put = backend.put || xhrPut;
+      let healed = false;
+      const send = async (range, body, base) => {
+        const tok = getToken();
+        const r = await put({ url: session, signal, body, headers: { ...(tok ? { Authorization: `Bearer ${tok}` } : {}), 'Content-Range': range },
+          onProgress: (n) => onProgress(Math.min(total, base + n), total) });
+        if (r.status === 401 && !healed && (await onAuthError(tok))) { healed = true; return send(range, body, base); }
+        return r;
+      };
+      const finished = (r) => r.status === 200 || r.status === 201;
+      const received = (r) => { const m = /bytes=0-(\d+)/.exec(r.header('Range') || ''); return m ? Number(m[1]) + 1 : 0; };
+      const fail = (r) => {
+        if (r.status === 401) throw new AuthError();
+        if (r.status === 404 || r.status === 410 || r.status === 400) throw new DriveError(410, 'The upload expired');
+        let msg = '';
+        try { msg = JSON.parse(r.text).error.message; } catch { /* not JSON */ }
+        throw new DriveError(r.status, msg || `Upload failed (${r.status})`);
+      };
+      let offset = 0;
+      let resyncs = 0;
+      let probe = !fresh;
+      for (let attempt = 0; ; ) {
+        try {
+          if (probe) {
+            const r = await send(`bytes */${total}`, null, 0);
+            if (finished(r)) { onProgress(total, total); return JSON.parse(r.text); }
+            if (r.status !== 308) fail(r);
+            offset = received(r);
+            probe = false;
+          }
+          onProgress(offset, total);
+          const r = await send(`bytes ${offset}-${total - 1}/${total}`, blob.slice(offset), offset);
+          if (finished(r)) { onProgress(total, total); return JSON.parse(r.text); }
+          if (r.status === 308) { offset = received(r); attempt = 0; continue; }
+          // The browser may quietly resend a cut-off PUT from its first byte; Drive refuses the overlap.
+          // Ask Drive where it is and go on from there.
+          if (r.status === 400 && resyncs++ < 3) { stats.retries++; probe = true; continue; }
+          if (r.status !== 429 && r.status < 500) fail(r);
+          throw new TypeError(`Upload interrupted (${r.status})`);
+        } catch (e) {
+          if (e.name === 'AbortError' || e.name === 'AuthError' || e.name === 'DriveError') throw e;
+          // Dropped connection or a server hiccup: wait, ask Drive how much it has, carry on from there.
+          if (++attempt > 6) throw new DriveError(0, navigator.onLine ? 'Network error' : 'You are offline');
+          stats.retries++;
+          await sleep(Math.min(20000, 1000 * 2 ** attempt));
+          probe = true;
+        }
+      }
     },
     /** Email of the signed-in Drive account (used as login_hint when renewing the token). */
     async about() {

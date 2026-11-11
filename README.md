@@ -111,18 +111,22 @@ How caching works: the app shell (page, scripts, `config.js`) is served from the
 
 Videos: small files (≤ 30 MB) are kept whole in a media cache (LRU, 600 MB). The first play streams and fills the cache from the same download; replays and seeks then come from the phone, and the viewer asks for the next and previous videos ahead of time so swiping to them starts at once. Skipped on Data Saver and 2G.
 
-## Save links to Eagle (share from the phone)
+## Save to Eagle (from the phone)
 
-Share any video page to **Perch** (Android share sheet), or open **⋯ → Save a link to Eagle** and paste the link (iPhone and everywhere else). Perch saves the link as a small JSON file in **My Drive / Perch Inbox**. The **Video Grabber** Eagle plugin (with its Perch inbox support) finds that folder through Google Drive for desktop, downloads the video with yt-dlp the next time Eagle is open on the computer, adds it to the library (tag `perch`), and writes the outcome back into the file, which Perch shows under **Recent**.
+Two ways, both through **My Drive / Perch Inbox**, which the **Video Grabber** Eagle plugin (with its Perch inbox support) finds through Google Drive for desktop. Each item is a small JSON request; the plugin writes the outcome back into it and Perch shows it under **Recent**. Items go into the library that was open in Perch; if Eagle has another library open, they wait until that library is opened.
 
+- **A video the phone already has** (no computer download): download it on the phone (e.g. with YTDLnis, a free yt-dlp app for Android), then share the file to **Perch**, or open **⋯ → Save to Eagle → Upload a video from this phone**. Perch uploads it to the inbox (resumable: a dropped connection or a closed app carries on from the last byte Drive has) and writes its request next to it. When Eagle opens, the plugin adds the file straight from the synced folder (tag `perch`) and removes it from the inbox.
+- **A link:** share a video page to Perch or paste it. Video Grabber downloads it with yt-dlp the next time Eagle is open on the computer.
+
+Notes:
 - The first save asks Google once for `drive.file`: Perch can create files and see only the files it created. Reading the library stays `drive.readonly`.
-- A link is downloaded into the library that was open in Perch when it was saved. If Eagle has another library open, the link waits until that library is opened.
-- The share-sheet entry needs the app installed from Chrome (Android). After this update it can take a day to appear; removing and re-adding the app applies it at once.
+- Shared files wait in the `perch-share` cache until they are in Drive, so nothing is lost if Perch closes mid-upload. Uploads only run while Perch is open.
+- The share-sheet entry needs the app installed from Chrome (Android). After an update that changes it, removing and re-adding the app applies it at once (Chrome otherwise updates it within about a day).
 
 ## Privacy and limits
 
 - **Access:**
-  - Scope is `drive.readonly`. The only writes are the link inbox (`drive.file`, asked for the first time a link is saved): Perch can only create files and see the ones it made. It never changes your library.
+  - Scope is `drive.readonly`. The only writes are the inbox (`drive.file`, asked for the first time something is saved): Perch can only create files and see the ones it made. It never changes your library.
   - The OAuth token lives in this browser only: localStorage, plus the Cache API so the service worker can stream video.
   - Tokens expire after an hour and there is no refresh token. Perch renews silently (`prompt=none` with `login_hint` = the account's email, learned from Drive after sign-in) shortly before expiry, at launch, on resume when under 10 minutes are left, and after any 401 (the failed request is then retried). The renew runs in a hidden frame first, so the app stays on screen; where the frame can't see the Google session (third-party cookies blocked, e.g. iOS), it falls back to a page redirect that saves the screen state first (library, folder, search, scroll, open item, video time) and restores it after. At most one redirect attempt per 2 minutes. **Reconnect** only appears when Google says the user must act (`interaction_required`, `login_required`, `consent_required`, `account_selection_required`).
   - **Sign out** revokes the token and deletes all cached data on the device.

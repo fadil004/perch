@@ -1046,3 +1046,16 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   .v-btn:hover { background: rgba(255, 255, 255, .1); }
   .dock button:hover { background: rgba(255, 255, 255, .06); }
 }
+
+/* Save to Eagle: videos uploaded from the phone */
+.btn-fill { height: 50px; border-radius: 999px; background: var(--fill); color: var(--t1); font-size: 16px; font-weight: 600; letter-spacing: -.01em; display: flex; align-items: center; justify-content: center; gap: 8px; transition: transform 160ms var(--ease-out), opacity 160ms var(--ease-out); }
+.btn-fill:active { transform: scale(.97); opacity: .8; }
+.btn-fill .ico { width: 20px; height: 20px; display: grid; place-items: center; }
+.btn-fill .ico svg { width: 20px; height: 20px; }
+.group-label.flush { padding: 10px 2px 0; }
+.link-row.uploading .link-dot { background: #0a84ff; }
+.link-row.saved .link-dot { background: #30d158; }
+.up-bar { height: 3px; border-radius: 2px; background: var(--fill); margin-top: 6px; overflow: hidden; }
+.up-bar i { display: block; height: 100%; background: #0a84ff; border-radius: 2px; transition: width 200ms linear; }
+.link-retry { flex: none; height: 32px; padding: 0 14px; border-radius: 999px; background: var(--fill); color: var(--t1); font-size: 14px; font-weight: 600; }
+.up-note { padding: 2px 12px 4px; }

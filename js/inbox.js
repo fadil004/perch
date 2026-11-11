@@ -1,10 +1,10 @@
-// Link inbox: links saved on the phone wait in Drive until Video Grabber (inside Eagle on the computer)
-// downloads them into the library.
+// Inbox: what the phone sends to Eagle waits in "My Drive/Perch Inbox" until Video Grabber (inside Eagle on
+// the computer) picks it up. Google Drive for desktop syncs that folder to the computer.
 //
-// Each link is one small JSON file in "My Drive/Perch Inbox". Google Drive for desktop syncs that folder
-// to the computer, where the plugin reads it, downloads the video with yt-dlp, adds it to Eagle and
-// writes the outcome back into the same file (status, title, error). Perch only ever creates files here
-// (drive.file scope) and reads them back for the status list.
+// Each request is one small JSON file. A link: the plugin downloads it with yt-dlp. A video the phone
+// already has: Perch uploads it next to the request and the plugin only adds it to Eagle. Either way the
+// plugin writes the outcome back into the same JSON (status, title, error). Perch only ever creates files
+// here (drive.file scope) and reads them back for the status list.
 import { FOLDER } from './drive.js';
 import { lsGet, lsSet } from './util.js';
 
@@ -33,29 +33,41 @@ async function inboxFolder(drive, modeKey, { create = false } = {}) {
   return id;
 }
 
-/** Save one link for Eagle. Resolves with the created Drive file. */
-export async function saveLink(drive, modeKey, { url, library }) {
-  const request = {
-    v: 1,
-    url,
-    library: library ? library.name.replace(/\.library$/i, '') : '',
-    sentAt: new Date().toISOString(),
-    from: 'Perch',
-    status: 'pending',
-  };
-  const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
-  const body = JSON.stringify(request, null, 2);
+/**
+ * Run fn(folderId) against the inbox. A folder this app didn't make (or one since deleted) can't take new
+ * files under drive.file: then make our own and try once more.
+ */
+export async function withInbox(drive, modeKey, fn) {
   const folder = await inboxFolder(drive, modeKey, { create: true });
   try {
-    return await drive.createFile(name, [folder], body);
+    return await fn(folder);
   } catch (e) {
-    // A folder this app didn't make (or one since deleted) can't take new files: make our own.
     if (e.name !== 'DriveError' || (e.status !== 403 && e.status !== 404) || /insufficient|scope/i.test(e.message)) throw e;
     lsSet(folderKey(modeKey), null);
     const own = (await drive.createFolder(INBOX_NAME)).id;
     lsSet(folderKey(modeKey), own);
-    return drive.createFile(name, [own], body);
+    return fn(own);
   }
+}
+
+const libraryName = (library) => (library ? library.name.replace(/\.library$/i, '') : '');
+export const newStem = (t = Date.now()) => `${t}-${Math.random().toString(36).slice(2, 8).padEnd(6, '0')}`;
+
+/** Save one link for Eagle (Video Grabber downloads it on the computer). Resolves with the created Drive file. */
+export async function saveLink(drive, modeKey, { url, library }) {
+  const request = { v: 1, url, library: libraryName(library), sentAt: new Date().toISOString(), from: 'Perch', status: 'pending' };
+  const body = JSON.stringify(request, null, 2);
+  const name = `${newStem()}.json`;
+  return withInbox(drive, modeKey, (folder) => drive.createFile(name, [folder], body));
+}
+
+/**
+ * The request next to a video uploaded from the phone: Eagle only has to add the file, nothing to download.
+ * `file` is the uploaded file's name in the same folder; `name` is what the phone called it.
+ */
+export async function saveFileRequest(drive, folder, { stem, file, name, size, mimeType, url = '', library }) {
+  const request = { v: 1, kind: 'file', file, name, size, mimeType, url, library: libraryName(library), sentAt: new Date().toISOString(), from: 'Perch', status: 'pending' };
+  return drive.createFile(`${stem}.json`, [folder], JSON.stringify(request, null, 2));
 }
 
 /** The latest links with their status as the plugin reported it, newest first. */
