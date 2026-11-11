@@ -4,11 +4,11 @@
 // 2. Streams Drive media: ./media/<fileId> → Drive alt=media with the OAuth token and the Range header,
 //    so <video> can seek without downloading whole files.
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v3';
+const VERSION = 'perch-v5';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './config.js', './css/app.css',
   './js/main.js', './js/util.js', './js/icons.js', './js/store.js', './js/auth.js', './js/drive.js',
-  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js',
+  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js', './js/framestep.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',
 ];
 const DRIVE = 'https://www.googleapis.com/drive/v3/files/';
@@ -89,10 +89,10 @@ async function staleWhileRevalidate(event, req) {
 
 // Small JSON values written by the page (auth token, mode, demo media map).
 let kvMemo = { t: 0, v: {} };
-async function kv(key) {
+async function kv(key, { fresh = false } = {}) {
   const now = Date.now();
   if (now - kvMemo.t > 2000) kvMemo = { t: now, v: {} };
-  if (key in kvMemo.v) return kvMemo.v[key];
+  if (!fresh && key in kvMemo.v) return kvMemo.v[key];
   let value = null;
   try {
     const c = await caches.open('perch-kv');
@@ -106,19 +106,28 @@ async function kv(key) {
 async function media(req, id) {
   if (id === '__ping') return new Response(null, { status: 204 });
   const range = req.headers.get('range');
-  const mode = await kv('mode');
+  const mode = await kv('mode', { fresh: true });
   if (mode && mode.mode === 'demo') {
     const map = await kv('demo-map');
     const src = map && map[id];
     if (!src) return new Response('Not found', { status: 404 });
     return fetch(src, { headers: range ? { Range: range } : {} });
   }
-  const auth = await kv('auth');
+  // The token is read fresh every time: right after a renew the page has just stored a new one.
+  let auth = await kv('auth', { fresh: true });
   if (!auth || !auth.token) return new Response('Sign in required', { status: 401 });
-  const headers = { Authorization: `Bearer ${auth.token}` };
-  if (range) headers.Range = range;
+  const get = (tok) => {
+    const headers = { Authorization: `Bearer ${tok}` };
+    if (range) headers.Range = range;
+    return fetch(`${DRIVE}${encodeURIComponent(id)}?alt=media&supportsAllDrives=true`, { headers });
+  };
   try {
-    return await fetch(`${DRIVE}${encodeURIComponent(id)}?alt=media&supportsAllDrives=true`, { headers });
+    let res = await get(auth.token);
+    if (res.status === 401) {
+      const again = await kv('auth', { fresh: true });   // a renew may have landed meanwhile
+      if (again && again.token && again.token !== auth.token) res = await get(again.token);
+    }
+    return res;
   } catch {
     return new Response('Offline', { status: 503 });
   }

@@ -5,13 +5,23 @@ import { I } from './icons.js';
 import { cachedThumb, loadThumb, thumbIdOf } from './thumbs.js';
 import { embedFor, hostOf } from './eagle.js';
 import { layers } from './layers.js';
+import { FrameStepper } from './framestep.js';
 
 const GAP = 22;
+// Dev-only: ?rotate=css forces the CSS fallback of the rotate button (localhost / *.localhost).
+const DEV_HOST = /^(localhost|127\.0\.0\.1|\[::1\])$|\.localhost$/.test(location.hostname);
+const ROTATE_FORCE = DEV_HOST ? new URLSearchParams(location.search).get('rotate') : null;
+const ROTATABLE = new Set(['video', 'image', 'gif', 'link']);
+const ROTATE_TIMEOUT = 1200;   // a fullscreen or orientation-lock promise that never settles must not hang the button
+const within = (p, ms) => Promise.race([Promise.resolve(p), new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
 const EASE = 'cubic-bezier(.2,.8,.2,1)';
 export const FOLDER_COLORS = { red: '#ff453a', orange: '#ff9f0a', yellow: '#ffd60a', green: '#32d74b', aqua: '#64d2ff', blue: '#0a84ff', purple: '#bf5af2', pink: '#ff375f' };
 
 export class Viewer {
-  constructor({ grid, media, getLibrary, onTag, onFolder, toast, canOpenDrive }) {
+  constructor({ grid, media, getLibrary, onTag, onFolder, toast, canOpenDrive, onAuthNeeded, onReconnect, onClosed }) {
+    this.onAuthNeeded = onAuthNeeded;
+    this.onReconnect = onReconnect;
+    this.onClosed = onClosed;
     this.grid = grid;
     this.mediaSrc = media;
     this.getLibrary = getLibrary;
@@ -46,11 +56,35 @@ export class Viewer {
     closeBtn.addEventListener('click', () => this.close());
     infoBtn.addEventListener('click', () => this.setInfo(this.infoQ < 0.5));
 
+    // Rotate to landscape: real orientation lock where the browser allows it, CSS rotation otherwise.
+    this.rot = null;          // null | 'lock' | 'css'
+    this.rotBtn = document.getElementById('v-rotate');
+    this.rotBtn.innerHTML = I.rotate;
+    this.rotBtn.addEventListener('click', () => this.toggleRotate());
+    this.satProbe = h('div', { 'aria-hidden': 'true', style: { position: 'absolute', top: '0', left: '0', width: '0', height: 'var(--sat)', visibility: 'hidden', pointerEvents: 'none' } });
+    this.root.append(this.satProbe);
+    this.rotTry = 0;          // id of the rotate attempt in flight (0 = none)
+    document.addEventListener('fullscreenchange', () => {
+      if (document.fullscreenElement) {
+        // A fullscreen request that resolved after we gave up on it: undo it.
+        if (this.rot !== 'lock' && !this.rotTry) this.leaveFullscreen();
+        return;
+      }
+      if (this.rot !== 'lock') return;
+      try { screen.orientation.unlock(); } catch { /* ignore */ }   // left fullscreen with the system back gesture
+      this.rot = null;
+      this.updateRotateBtn();
+    });
+
     for (let k = 0; k < 3; k++) this.slots.push(this.makeSlot());
     this.buildControls();
     this.bindGestures();
     this.bindInfoDrag();
-    addEventListener('resize', () => { if (this.isOpen) this.relayout(); });
+    addEventListener('resize', () => {
+      if (this.rot === 'css' && innerWidth > innerHeight) { this.setCssRotation(false); return; }   // the phone itself turned
+      if (this.rot === 'css') this.sizeRotated();
+      if (this.isOpen) { this.relayout(); this.updateRotateBtn(); }
+    });
     addEventListener('keydown', (e) => {
       if (!this.isOpen) return;
       if (e.key === 'Escape') { e.preventDefault(); this.infoQ > 0.5 ? this.setInfo(false) : this.close(); }
@@ -64,9 +98,93 @@ export class Viewer {
 
   get cur() { return this.slots[1]; }
 
+  // The stage's own frame: in the CSS-rotated fallback its width is the screen height and vice versa.
+  get VW() { return this.rot === 'css' ? innerHeight : innerWidth; }
+  get VH() { return this.rot === 'css' ? innerWidth : innerHeight; }
+  px(e) { return this.rot === 'css' ? e.clientY : e.clientX; }
+  py(e) { return this.rot === 'css' ? innerWidth - e.clientX : e.clientY; }
+  satPx() { return this.satProbe.offsetHeight; }
+
+  // ── rotate ────────────────────────────────────────────────────────────────
+  async toggleRotate() {
+    // A second tap always gets back to portrait: while an attempt is pending, while locked, while rotated.
+    if (this.rotTry || this.rot) { this.exitRotation(); return; }
+    const o = screen.orientation;
+    const canLock = ROTATE_FORCE !== 'css' && document.fullscreenEnabled && this.root.requestFullscreen && o && typeof o.lock === 'function';
+    if (canLock) {
+      const id = (this.rotTry = performance.now());
+      this.rotBtn.classList.add('on');
+      try {
+        // Android/Chrome: a locked orientation overrides the system rotation lock, but only in fullscreen.
+        if (!document.fullscreenElement) await within(this.root.requestFullscreen({ navigationUI: 'hide' }), ROTATE_TIMEOUT);
+        if (this.rotTry !== id) return;                       // cancelled by a second tap meanwhile
+        const lock = o.lock('landscape');
+        lock.then(() => { if (this.rot !== 'lock' && this.rotTry !== id) { try { o.unlock(); } catch { /* ignore */ } } }, () => {});
+        await within(lock, ROTATE_TIMEOUT);
+        if (this.rotTry !== id) { try { o.unlock(); } catch { /* ignore */ } return; }
+        this.rotTry = 0;
+        this.rot = 'lock';
+        this.updateRotateBtn();
+        return;
+      } catch {
+        if (this.rotTry !== id) return;
+        this.rotTry = 0;
+        try { o.unlock(); } catch { /* ignore */ }
+        await this.leaveFullscreen();                         // clean up a half-entered fullscreen
+        if (this.rot || !this.isOpen) return;
+      }
+    }
+    this.setCssRotation(true);   // iOS Safari, desktop, or a lock that was rejected or never answered
+  }
+
+  async leaveFullscreen() {
+    if (!document.fullscreenElement) return;
+    try { await within(document.exitFullscreen(), ROTATE_TIMEOUT); } catch { /* ignore */ }
+  }
+
+  exitRotation() {
+    const was = this.rot;
+    this.rotTry = 0;                                          // cancels an attempt still in flight
+    if (was === 'css') this.setCssRotation(false);
+    this.rot = null;
+    try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch { /* ignore */ }
+    this.leaveFullscreen();
+    this.updateRotateBtn();
+  }
+
+  setCssRotation(on) {
+    this.rot = on ? 'css' : null;
+    this.root.classList.toggle('rot', on);
+    this.sizeRotated();
+    if (this.isOpen) this.relayout();
+    this.updateRotateBtn();
+  }
+
+  sizeRotated() {
+    const st = this.root.style;
+    if (this.rot === 'css') {
+      const W = innerWidth, H = innerHeight;
+      st.width = `${H}px`;
+      st.height = `${W}px`;
+      st.transform = `translate(${W}px, 0) rotate(90deg)`;
+    } else {
+      st.width = st.height = st.transform = '';
+    }
+  }
+
+  /** Only for landscape media on a portrait screen, and always while rotated (to undo it). */
+  updateRotateBtn() {
+    const it = this.cur && this.cur.item;
+    const wide = !!(it && ROTATABLE.has(it.kind) && it.w > it.h);
+    this.rotBtn.hidden = !(this.rot || this.rotTry || (wide && innerHeight > innerWidth));
+    this.rotBtn.classList.toggle('on', !!(this.rot || this.rotTry));
+    this.rotBtn.setAttribute('aria-pressed', String(!!this.rot));
+    this.rotBtn.setAttribute('aria-label', this.rot ? 'Back to portrait' : 'Rotate to landscape');
+  }
+
   // ── layout ────────────────────────────────────────────────────────────────
   fit(it) {
-    const vw = innerWidth, vh = innerHeight;
+    const vw = this.VW, vh = this.VH;
     let w = it?.w, hh = it?.h;
     if (!(w > 0 && hh > 0)) { w = 1; hh = 1; }
     const s = Math.min(vw / w, vh / hh);
@@ -81,12 +199,12 @@ export class Viewer {
     const load = h('div', { class: 'v-load' });
     const el = h('div', { class: 'v-slide' }, media, load);
     this.track.append(el);
-    return { el, media, zoom, thumb, load, item: null, idx: -1, pos: 0, tok: 0, full: null, video: null, iframe: null, play: null, msg: null, blobUrl: null };
+    return { el, media, zoom, thumb, load, item: null, idx: -1, pos: 0, tok: 0, full: null, video: null, iframe: null, play: null, msg: null, blobUrl: null, stepper: null, vready: false, resume: null, lastTime: null, playing: false };
   }
 
   positionSlot(slot, pos) {
     slot.pos = pos;
-    slot.el.style.transform = `translateX(${pos * (innerWidth + GAP)}px)`;
+    slot.el.style.transform = `translateX(${pos * (this.VW + GAP)}px)`;
   }
 
   layoutSlot(slot) {
@@ -123,6 +241,7 @@ export class Viewer {
 
   clearSlot(slot) {
     slot.tok++;
+    this.dropStepper(slot);
     if (slot.video) { try { slot.video.pause(); } catch { /* ignore */ } slot.video.removeAttribute('src'); slot.video.load(); slot.video.remove(); slot.video = null; }
     if (slot.iframe) { slot.iframe.remove(); slot.iframe = null; }
     if (slot.full) { slot.full.remove(); slot.full = null; }
@@ -130,6 +249,9 @@ export class Viewer {
     if (slot.msg) { slot.msg.remove(); slot.msg = null; }
     if (slot.blobUrl) { URL.revokeObjectURL(slot.blobUrl); slot.blobUrl = null; }
     slot.load.classList.remove('on');
+    slot.resume = null;
+    slot.lastTime = null;
+    slot.playing = false;
     slot.thumb.removeAttribute('src');
     slot.media.style.backgroundColor = '';
     slot.media.classList.remove('clip');
@@ -156,9 +278,18 @@ export class Viewer {
         const src = await this.mediaSrc.src(it.f.main, { size: it.size, onProgress: (p) => this.progress(slot, p) });
         if (slot.tok !== tok) { if (src.startsWith('blob:')) URL.revokeObjectURL(src); return; }
         if (src.startsWith('blob:')) slot.blobUrl = src;
+        const resume = slot.resume;
+        slot.resume = null;
         v.src = src;
-        const p = v.play();
-        if (p && p.catch) p.catch(() => { this.vcSync(); });
+        if (resume) {
+          v.addEventListener('loadedmetadata', () => {
+            try { v.currentTime = clamp(resume.t || 0, 0, Math.max(0, v.duration - 0.05)); } catch { /* ignore */ }
+            if (resume.playing) this.playResumed(v); else this.vcSync();
+          }, { once: true });
+        } else {
+          const p = v.play();
+          if (p && p.catch) p.catch(() => { this.vcSync(); });
+        }
       } catch (e) {
         if (slot.tok === tok) this.fail(slot, e);
       }
@@ -209,15 +340,51 @@ export class Viewer {
   }
 
   fail(slot, e) {
+    if (e && e.name === 'AuthError') {
+      if (this.mediaSrc.refreshing && this.mediaSrc.refreshing()) this.showMsg(slot, 'Refreshing…');
+      else this.showMsg(slot, 'Reconnect to play', () => this.onReconnect && this.onReconnect());
+      return;
+    }
+    this.showMsg(slot, navigator.onLine ? 'Couldn’t load this file' : 'You’re offline');
+  }
+
+  showMsg(slot, text, action) {
     slot.load.classList.remove('on');
     if (slot.msg) slot.msg.remove();
-    const auth = e && e.name === 'AuthError';
-    slot.msg = h('div', { class: 'v-msg' }, auth ? 'Reconnect to play' : navigator.onLine ? 'Couldn’t load this file' : 'You’re offline');
+    slot.msg = action
+      ? h('button', { class: 'v-msg act', type: 'button', onclick: (e) => { e.stopPropagation(); action(); } }, text)
+      : h('div', { class: 'v-msg' }, text);
     slot.el.append(slot.msg);
+    if (slot === this.cur) this.fsSync();
+  }
+
+  /** A video stopped with an error: if it was the token, renew quietly and come back to this frame. */
+  async mediaError(slot, v) {
+    const it = slot.item;
+    const auth = it && this.mediaSrc.authFailed ? await this.mediaSrc.authFailed(it.f.main) : false;
+    if (slot.video !== v) return;
+    if (!auth) { this.fail(slot, this.mediaSrc.lastError ? this.mediaSrc.lastError() : null); return; }
+    this.showMsg(slot, 'Refreshing…');
+    const t = v.currentTime > 0 ? v.currentTime : (slot.lastTime || 0);
+    const started = this.onAuthNeeded ? this.onAuthNeeded({ id: it.id, t, playing: slot.playing }) : false;
+    if (!started && slot.video === v) this.showMsg(slot, 'Reconnect to play', () => this.onReconnect && this.onReconnect());
+  }
+
+  playResumed(v) {
+    const p = v.play();
+    if (!p || !p.catch) return;
+    p.catch(() => {
+      // Autoplay with sound can be refused after a page load; play muted rather than not at all.
+      if (v.muted) { this.vcSync(); return; }
+      v.muted = true;
+      this.muted = true;
+      this.vcSync();
+      v.play().catch(() => this.vcSync());
+    });
   }
 
   // ── open / close ──────────────────────────────────────────────────────────
-  open(items, index, originRect) {
+  open(items, index, originRect, { resume = null } = {}) {
     if (this.isOpen) return;
     this.items = items;
     this.index = index;
@@ -232,6 +399,7 @@ export class Viewer {
     this.setSlot(this.slots[0], index - 1, -1);
     this.setSlot(this.slots[1], index, 0);
     this.setSlot(this.slots[2], index + 1, 1);
+    this.slots[1].resume = resume;
     this.updateChromeFor();
     this.setChrome(true, true);
     this.grid.setGhost(index);
@@ -272,6 +440,8 @@ export class Viewer {
   close({ velocity = 0, fromHistory = false } = {}) {
     if (!this.isOpen || this.closing) return;
     this.closing = true;
+    const wasRotated = !!(this.rot || this.rotTry);
+    if (wasRotated) this.exitRotation();
     if (this.openAnim) { this.openAnim.finish(); }
     this.pageAnim && this.pageAnim.stop();
     clearTimeout(this.chromeTimer);
@@ -285,7 +455,7 @@ export class Viewer {
     const f = cur.fitRect;
     this.grid.ensureVisible(this.index);
     this.grid.setGhost(this.index);
-    const rect = this.grid.tileRect(this.index);
+    const rect = wasRotated ? null : this.grid.tileRect(this.index);
     const live = liveTransform(cur.media);
     const z = { ...this.zoom };
     const bg0 = Number(getComputedStyle(this.bg).opacity) || 0;
@@ -300,6 +470,7 @@ export class Viewer {
       this.grid.setGhost(-1);
       for (const s of this.slots) this.clearSlot(s);
       this.bg.style.opacity = '0';
+      if (this.onClosed) this.onClosed();
     };
     if (reducedMotion.matches) {
       this.root.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 160, easing: 'ease-out' }).finished.then(done, done);
@@ -334,7 +505,7 @@ export class Viewer {
     const next = this.index + dir;
     if (dir && (next < 0 || next >= this.items.length)) dir = 0;
     if (this.pageAnim) this.pageAnim.stop();
-    const W = innerWidth + GAP;
+    const W = this.VW + GAP;
     const target = -dir * W;
     if (reducedMotion.matches) { this.setTrack(target); if (dir) this.shift(dir); else this.setTrack(0); return; }
     this.pageAnim = spring({
@@ -359,9 +530,10 @@ export class Viewer {
     this.positionSlot(this.slots[0], -1);
     this.positionSlot(this.slots[1], 0);
     this.positionSlot(this.slots[2], 1);
-    this.setTrack(this.trackX + dir * (innerWidth + GAP));
+    this.setTrack(this.trackX + dir * (this.VW + GAP));
     if (Math.abs(this.trackX) < 0.5) this.setTrack(0);
     // Old current becomes a neighbour: stop its media but keep the thumbnail.
+    this.dropStepper(old);
     if (old.video) { old.video.pause(); old.video.removeAttribute('src'); old.video.load(); old.video.remove(); old.video = null; }
     if (old.iframe) { old.iframe.remove(); old.iframe = null; }
     if (old.play) { old.play.remove(); old.play = null; }
@@ -404,11 +576,13 @@ export class Viewer {
   updateChromeFor() {
     const it = this.cur.item;
     this.counter.textContent = this.items.length > 1 ? `${this.index + 1} / ${this.items.length}` : '';
+    this.updateRotateBtn();
     this.bottom.replaceChildren();
     if (!it) return;
     if (it.kind === 'video') {
-      this.bottom.append(this.vc.root);
+      this.bottom.append(this.vc.root, this.fs.root);
       this.vcReset(it);
+      this.fsSync();
     } else if (it.kind === 'link' && it.url) {
       this.bottom.append(h('a', { class: 'v-open', href: it.url, target: '_blank', rel: 'noopener noreferrer' }, h('span', { html: I.external, style: { display: 'contents' } }), h('span', null, hostOf(it.url) || 'Open link')));
     } else if (it.kind === 'file' && it.f.main && this.canOpenDrive()) {
@@ -439,11 +613,12 @@ export class Viewer {
       this.vcSync();
       this.scheduleChromeHide();
     });
-    const seekTo = (clientX) => {
+    const seekTo = (e) => {
       const v = this.cur.video;
       if (!v || !isFinite(v.duration) || !v.duration) return;
       const r = rail.getBoundingClientRect();
-      const p = clamp((clientX - r.left) / r.width, 0, 1);
+      // In the CSS-rotated fallback the rail runs down the screen.
+      const p = clamp(this.rot === 'css' ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width, 0, 1);
       v.currentTime = p * v.duration;
       this.vcPaint(p);
     };
@@ -454,10 +629,11 @@ export class Viewer {
       scrub.classList.add('active');
       const v = this.cur.video;
       this.wasPlaying = v && !v.paused;
+      if (this.cur.stepper) this.cur.stepper.interrupt();
       if (v) v.pause();
-      seekTo(e.clientX);
+      seekTo(e);
     });
-    scrub.addEventListener('pointermove', (e) => { if (this.scrubbing) seekTo(e.clientX); });
+    scrub.addEventListener('pointermove', (e) => { if (this.scrubbing) seekTo(e); });
     const end = () => {
       if (!this.scrubbing) return;
       this.scrubbing = false;
@@ -465,9 +641,40 @@ export class Viewer {
       const v = this.cur.video;
       if (v && this.wasPlaying) v.play().catch(() => {});
       this.scheduleChromeHide();
+      this.fsSync();
     };
     scrub.addEventListener('pointerup', end);
     scrub.addEventListener('pointercancel', end);
+
+    // Frame step: a small pill above the row, only while the video is paused.
+    const prev = h('button', { class: 'fs-b', type: 'button', 'aria-label': 'Previous frame', html: I.framePrev });
+    const next = h('button', { class: 'fs-b', type: 'button', 'aria-label': 'Next frame', html: I.frameNext });
+    const tc = h('span', { class: 'fs-t', dir: 'ltr' }, '0:00:00');
+    this.fs = { root: h('div', { class: 'fs', role: 'group', 'aria-label': 'Frame by frame' }, prev, tc, next), prev, next, tc, on: false, text: '', first: false, last: false };
+    const stepBy = (dir) => (e) => {
+      e.stopPropagation();
+      if (this.cur.stepper && this.fs.on) this.cur.stepper.step(dir);
+    };
+    prev.addEventListener('click', stepBy(-1));
+    next.addEventListener('click', stepBy(1));
+  }
+
+  dropStepper(slot) {
+    if (slot.stepper) { slot.stepper.destroy(); slot.stepper = null; }
+    slot.vready = false;
+  }
+
+  /** Show the frame-step pill only for a paused, loaded video, and keep its readout current. */
+  fsSync() {
+    const fs = this.fs, slot = this.cur, v = slot && slot.video, st = slot && slot.stepper;
+    const on = !!(v && st && slot.vready && v.paused && !slot.msg && !(this.scrubbing && this.wasPlaying));
+    if (on !== fs.on) { fs.on = on; fs.root.classList.toggle('on', on); }
+    if (!on) return;
+    const text = st.timecode();
+    if (text !== fs.text) { fs.text = text; fs.tc.textContent = text; }
+    const first = st.atStart(), last = st.atEnd();
+    if (first !== fs.first) { fs.first = first; fs.prev.classList.toggle('dim', first); fs.prev.setAttribute('aria-disabled', String(first)); }
+    if (last !== fs.last) { fs.last = last; fs.next.classList.toggle('dim', last); fs.next.setAttribute('aria-disabled', String(last)); }
   }
 
   vcReset(it) {
@@ -502,6 +709,9 @@ export class Viewer {
       }
       if (!v.paused) v._raf = requestAnimationFrame(tick);
     };
+    slot.stepper = new FrameStepper(v, { key: slot.item.id, onUpdate: () => { if (isCur() && (v.paused || this.fs.on)) this.fsSync(); } });
+    v.addEventListener('loadeddata', () => { if (slot.video === v) slot.vready = true; });
+    for (const type of ['loadeddata', 'pause', 'play', 'seeked']) v.addEventListener(type, () => { if (isCur()) this.fsSync(); });
     v.addEventListener('loadedmetadata', () => { if (isCur() && isFinite(v.duration)) this.vc.d.textContent = fmtDuration(v.duration); });
     v.addEventListener('play', () => { if (!isCur()) return; this.vcSync(); cancelAnimationFrame(v._raf); v._raf = requestAnimationFrame(tick); this.scheduleChromeHide(); });
     v.addEventListener('pause', () => { if (!isCur()) return; this.vcSync(); clearTimeout(this.chromeTimer); });
@@ -512,10 +722,14 @@ export class Viewer {
       if (!isCur() || !v.duration || !isFinite(v.duration) || !v.buffered.length) return;
       this.vc.buf.style.transform = `scaleX(${clamp(v.buffered.end(v.buffered.length - 1) / v.duration, 0, 1)})`;
     });
-    v.addEventListener('timeupdate', () => { if (isCur() && v.paused) tick(); });
+    v.addEventListener('timeupdate', () => { if (slot.video === v && !v.error) slot.lastTime = v.currentTime; if (isCur() && v.paused) tick(); });
+    v.addEventListener('seeking', () => { if (slot.video === v) slot.lastTime = v.currentTime; });
+    // Play intent (survives a scrub and a failed load), for restoring after a token renew.
+    v.addEventListener('play', () => { slot.playing = true; });
+    v.addEventListener('pause', () => { if (!v.error && !this.scrubbing) slot.playing = false; });
     v.addEventListener('error', () => {
       if (slot.video !== v || !v.getAttribute('src')) return;
-      this.fail(slot, this.mediaSrc.lastError ? this.mediaSrc.lastError() : null);
+      this.mediaError(slot, v);
     });
   }
 
@@ -545,7 +759,7 @@ export class Viewer {
   }
 
   zoomBounds(s) {
-    const f = this.cur.fitRect, vw = innerWidth, vh = innerHeight;
+    const f = this.cur.fitRect, vw = this.VW, vh = this.VH;
     const w = f.width * s, hh = f.height * s;
     const bx = w <= vw ? [(vw - w) / 2 - f.left, (vw - w) / 2 - f.left] : [vw - f.left - w, -f.left];
     const by = hh <= vh ? [(vh - hh) / 2 - f.top, (vh - hh) / 2 - f.top] : [vh - f.top - hh, -f.top];
@@ -566,7 +780,7 @@ export class Viewer {
   toggleZoomAt(cx, cy) {
     if (this.zoom.s > 1.01) { this.animateZoom({ s: 1, x: 0, y: 0 }); return; }
     const f = this.cur.fitRect;
-    const s = Math.max(2.5, Math.min(4, innerWidth / f.width, innerHeight / f.height) * 1.0);
+    const s = Math.max(2.5, Math.min(4, this.VW / f.width, this.VH / f.height) * 1.0);
     const lx = cx - f.left, ly = cy - f.top;
     const { bx, by } = this.zoomBounds(s);
     this.animateZoom({ s, x: clamp(lx * (1 - s), bx[0], bx[1]), y: clamp(ly * (1 - s), by[0], by[1]) });
@@ -631,7 +845,7 @@ export class Viewer {
   }
 
   infoHeight() {
-    return this.info.getBoundingClientRect().height || innerHeight * 0.5;
+    return this.info.offsetHeight || this.VH * 0.5;
   }
 
   /** q: 0 = closed, 1 = open. Moves the sheet and lifts the media into the space above it. */
@@ -642,11 +856,11 @@ export class Viewer {
     this.infoBtn.classList.toggle('on', q > 0.5);
     const cur = this.cur, f = cur.fitRect;
     if (!f) return;
-    const sat = safeTop();
-    const avail = Math.max(80, innerHeight - Hs - sat - 64);
-    const s = Math.min(1, avail / f.height, (innerWidth - 32) / f.width);
+    const sat = this.satPx();
+    const avail = Math.max(80, this.VH - Hs - sat - 64);
+    const s = Math.min(1, avail / f.height, (this.VW - 32) / f.width);
     const top = sat + 52 + (avail - f.height * s) / 2;
-    const left = (innerWidth - f.width * s) / 2;
+    const left = (this.VW - f.width * s) / 2;
     const p = clamp(q, 0, 1);
     const tx = lerp(0, left - f.left, p), ty = lerp(0, top - f.top, p), sc = lerp(1, s, p);
     cur.media.style.transform = p ? `translate(${tx}px, ${ty}px) scale(${sc})` : '';
@@ -678,18 +892,18 @@ export class Viewer {
       const onGrab = e.target.closest('.sheet-grab');
       const scrollable = this.info.scrollHeight > this.info.clientHeight + 1;
       if (!onGrab && (scrollable || e.target.closest('button, a'))) return;
-      d = { id: e.pointerId, y0: e.clientY, q0: this.infoQ, moved: false };
+      d = { id: e.pointerId, y0: this.py(e), q0: this.infoQ, moved: false };
       vel.reset();
-      vel.add(0, e.clientY);
+      vel.add(0, this.py(e));
       this.infoAnim && this.infoAnim.stop();
     });
     this.info.addEventListener('pointermove', (e) => {
       if (!d || e.pointerId !== d.id) return;
-      const dy = e.clientY - d.y0;
+      const dy = this.py(e) - d.y0;
       if (!d.moved && Math.abs(dy) < 5) return;
       if (!d.moved) { try { this.info.setPointerCapture(e.pointerId); } catch { /* ignore */ } }
       d.moved = true;
-      vel.add(0, e.clientY);
+      vel.add(0, this.py(e));
       const Hs = this.infoH || this.infoHeight();
       let q = d.q0 - dy / Hs;
       if (q > 1) q = 1 + rubberband(q - 1, 1, 0.3);
@@ -719,9 +933,9 @@ export class Viewer {
 
     root.addEventListener('pointerdown', (e) => {
       if (!this.isOpen || this.closing) return;
-      if (e.target.closest('.v-btn, .vc, .v-open, .v-info, .v-play, iframe, a')) return;
+      if (e.target.closest('.v-btn, .vc, .fs, .v-open, .v-info, .v-play, .v-msg, iframe, a')) return;
       if (e.button > 0) return;
-      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      pts.set(e.pointerId, { x: this.px(e), y: this.py(e) });
       try { root.setPointerCapture(e.pointerId); } catch { /* ignore */ }
       if (this.openAnim) this.openAnim.finish();
       if (pts.size === 2) {
@@ -737,20 +951,20 @@ export class Viewer {
       if (this.pageAnim) {
         this.pageAnim.stop();
         this.pageAnim = null;
-        const W = innerWidth + GAP;
+        const W = this.VW + GAP;
         if (this.trackX < -W / 2 && this.index < this.items.length - 1) this.shift(1);
         else if (this.trackX > W / 2 && this.index > 0) this.shift(-1);
         trackFrom = this.trackX;
       }
       this.zoomAnim && this.zoomAnim.stop();
-      g = { mode: null, x0: e.clientX, y0: e.clientY, t0: performance.now(), track0: trackFrom, z0: { ...this.zoom }, q0: this.infoQ, id: e.pointerId };
+      g = { mode: null, x0: this.px(e), y0: this.py(e), t0: performance.now(), track0: trackFrom, z0: { ...this.zoom }, q0: this.infoQ, id: e.pointerId };
       this.vel.reset();
-      this.vel.add(e.clientX, e.clientY);
+      this.vel.add(this.px(e), this.py(e));
     });
 
     root.addEventListener('pointermove', (e) => {
       if (!g || !pts.has(e.pointerId)) return;
-      pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      pts.set(e.pointerId, { x: this.px(e), y: this.py(e) });
       if (g.mode === 'pinch') {
         if (pts.size < 2) return;
         const f = this.cur.fitRect;
@@ -764,8 +978,8 @@ export class Viewer {
         return;
       }
       if (e.pointerId !== g.id) return;
-      this.vel.add(e.clientX, e.clientY);
-      const dx = e.clientX - g.x0, dy = e.clientY - g.y0;
+      this.vel.add(this.px(e), this.py(e));
+      const dx = this.px(e) - g.x0, dy = this.py(e) - g.y0;
       if (!g.mode) {
         if (Math.hypot(dx, dy) < 8) return;
         if (this.zoom.s > 1.01) g.mode = 'pan';
@@ -774,10 +988,10 @@ export class Viewer {
         else if (dy > 0) { g.mode = 'dismiss'; this.setChrome(false); if (this.cur.video) this.cur.video.pause(); }
         else g.mode = 'info';
         if (g.mode === 'info' && this.infoQ === 0) { this.renderInfo(); this.infoH = this.infoHeight(); }
-        g.x0 = e.clientX; g.y0 = e.clientY;
+        g.x0 = this.px(e); g.y0 = this.py(e);
         return;
       }
-      const W = innerWidth;
+      const W = this.VW;
       if (g.mode === 'page') {
         let x = g.track0 + dx;
         const atStart = this.index === 0 && x > 0, atEnd = this.index === this.items.length - 1 && x < 0;
@@ -793,7 +1007,7 @@ export class Viewer {
       } else if (g.mode === 'pan') {
         const { bx, by } = this.zoomBounds(this.zoom.s);
         const rb = (v, lo, hi, dim) => (v < lo ? lo - rubberband(lo - v, dim) : v > hi ? hi + rubberband(v - hi, dim) : v);
-        this.setZoom({ s: this.zoom.s, x: rb(g.z0.x + dx, bx[0], bx[1], W), y: rb(g.z0.y + dy, by[0], by[1], innerHeight) });
+        this.setZoom({ s: this.zoom.s, x: rb(g.z0.x + dx, bx[0], bx[1], W), y: rb(g.z0.y + dy, by[0], by[1], this.VH) });
       }
     });
 
@@ -813,13 +1027,13 @@ export class Viewer {
       }
       if (e.pointerId !== g.id) return;
       const { vx, vy } = this.vel.get();
-      const dx = e.clientX - g.x0, dy = e.clientY - g.y0;
+      const dx = this.px(e) - g.x0, dy = this.py(e) - g.y0;
       const mode = g.mode;
       const tap = !mode && performance.now() - g.t0 < 400;
       g = null;
-      if (tap) { this.handleTap(e.clientX, e.clientY); return; }
+      if (tap) { this.handleTap(this.px(e), this.py(e)); return; }
       if (mode === 'page') {
-        const W = innerWidth + GAP;
+        const W = this.VW + GAP;
         const rest = this.trackX + project(vx, 0.995);
         let dir = rest < -W / 2 ? 1 : rest > W / 2 ? -1 : 0;
         if (Math.abs(vx) > 350 && Math.sign(-vx) !== 0) dir = vx < 0 ? 1 : -1;
@@ -864,7 +1078,7 @@ export class Viewer {
   }
 
   applyDismiss(dx, dy) {
-    const vh = innerHeight;
+    const vh = this.VH;
     const cur = this.cur, f = cur.fitRect;
     const down = Math.max(0, dy);
     const s = 1 - Math.min(1, down / (vh * 0.9)) * 0.42;

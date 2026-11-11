@@ -29,6 +29,9 @@ export const I = {
   drive: s('<path d="M8.6 4.75h6.8l5.35 9.25-3.4 5.25H6.65L3.25 14z"/><path d="m8.6 4.75 5.4 9.25H3.25M15.4 4.75 9.95 14M17.35 19.25 14 14"/>'),
   copy: s('<rect x="8.25" y="8.25" width="11.5" height="11.5" rx="2"/><path d="M15.75 8.25v-2a2 2 0 0 0-2-2h-7.5a2 2 0 0 0-2 2v7.5a2 2 0 0 0 2 2h2"/>'),
   x: s('<path d="M7 7l10 10M17 7 7 17"/>'),
+  rotate: s('<rect x="3.75" y="10" width="16.5" height="9.5" rx="2.25"/><path d="M6.75 7a7.25 7.25 0 0 1 10.5 0"/><path d="M17.75 4.25v3h-3"/>'),
+  framePrev: s('<path d="M17.5 6.25v11.5"/><path d="M13.75 7.3v9.4a.5.5 0 0 1-.79.41l-6.7-4.7a.5.5 0 0 1 0-.82l6.7-4.7a.5.5 0 0 1 .79.41z"/>'),
+  frameNext: s('<path d="M6.5 6.25v11.5"/><path d="M10.25 7.3v9.4a.5.5 0 0 0 .79.41l6.7-4.7a.5.5 0 0 0 0-.82l-6.7-4.7a.5.5 0 0 0-.79.41z"/>'),
   // iOS share glyph (square + up arrow), Android overflow menu, "add to home screen" square.
   share: s('<path d="M12 3.75v10.5"/><path d="m8.4 7.1 3.6-3.4 3.6 3.4"/><path d="M8.75 10.25h-1.5a1.5 1.5 0 0 0-1.5 1.5v7a1.5 1.5 0 0 0 1.5 1.5h9.5a1.5 1.5 0 0 0 1.5-1.5v-7a1.5 1.5 0 0 0-1.5-1.5h-1.5"/>'),
   menuV: s(dot(12, 5.5, 1.5) + dot(12, 12, 1.5) + dot(12, 18.5, 1.5)),

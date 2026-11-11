@@ -1,8 +1,8 @@
 // Perch — boot, screens, sync orchestration, folders/search/more sheets.
-import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, rubberband, reducedMotion } from './util.js';
+import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, rubberband, reducedMotion, nextFrame } from './util.js';
 import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
-import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri } from './auth.js';
+import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER } from './auth.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -88,6 +88,17 @@ const media = {
     return URL.createObjectURL(new Blob(chunks, { type: res.headers.get('content-type') || '' }));
   },
   lastError: () => (S.mode === 'drive' && !tokenValid() ? { name: 'AuthError' } : null),
+  /** A video failed: was it the token? Asks the service worker's media route for one byte. */
+  async authFailed(fileId) {
+    if (S.mode !== 'drive') return false;
+    if (!tokenValid()) return true;
+    if (!S.swOk) return false;
+    try {
+      const r = await fetch(new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI), { headers: { Range: 'bytes=0-0' }, cache: 'no-store' });
+      return r.status === 401;
+    } catch { return false; }
+  },
+  refreshing: () => !!S.redirecting,
 };
 
 const viewer = new Viewer({
@@ -98,6 +109,10 @@ const viewer = new Viewer({
   canOpenDrive: () => S.mode === 'drive',
   onTag: (t) => { viewer.close(); setTimeout(() => openSearch({ tags: [t] }), 60); },
   onFolder: (id) => { viewer.close(); setTimeout(() => selectView({ type: 'folder', id }), 60); },
+  // A video hit a 401 mid-use: renew silently and come back to the same frame.
+  onAuthNeeded: (info) => { S.resumeVideo = info; if (S.mode !== 'drive') return false; expireToken(); return renewNow('401'); },
+  onReconnect: () => reconnect(),
+  onClosed: () => { if (S.renewWhenIdle) { S.renewWhenIdle = false; renewNow('idle'); } },
 });
 
 function openViewer(i, tile) {
@@ -186,25 +201,124 @@ async function startDemo(mode) {
 async function startDrive(red) {
   S.mode = 'drive';
   S.modeKey = 'drive';
-  S.drive = createDrive({ backend: fetchBackend(), getToken: token, onAuthError: onAuthLost });
+  S.drive = createDrive({ backend: fetchBackend(), getToken: token, onAuthError: () => onAuthExpired() });
   await swkv.set('mode', { mode: 'drive' });
   setThumbSource(S.drive);
   if (tokenValid()) {
     await swkv.set('auth', getAuth());
+    // Learn which account this is, so renewals can name it (login_hint).
+    if ((red && red.ok) || !getAuth().email) S.drive.about().then(rememberAccount).catch(() => {});
+    // Close to expiry at launch: renew now rather than in the middle of a video (never right after a renew).
+    if (!red && renewNow('start')) return;
     return afterConnect();
   }
-  // Token expired: a silent round trip to Google usually returns a fresh one instantly.
-  if (!red && canTrySilent()) { signIn({ silent: true }); return; }
+  // Expired: a silent round trip to Google usually returns a fresh token instantly.
+  if (!red && renewNow('start')) return;
   const saved = lsGet('perch.lib.drive');
   const snap = saved ? await kv.get(snapKey(saved.id)).catch(() => null) : null;
   if (saved && snap) {
-    S.lib = saved;
-    applySnapshot(snap, { reveal: true });
-    showScreen('main');
-    onAuthLost();
+    await openLibrary(saved);
+    if (red && red.error && red.silent && !NEEDS_USER.has(red.error)) {
+      // Google failed for another reason (not "needs the user"): offer a retry of the silent renew.
+      setNotice('Couldn’t refresh sign-in · Retry', () => { saveUiState(); S.redirecting = true; signIn({ silent: true }); });
+    } else onAuthLost();
     return;
   }
   showOnboarding();
+}
+
+// ── token renewal ────────────────────────────────────────────────────────────
+// Tokens last an hour. Renew them silently at launch, on resume and after a 401, with the UI state
+// saved first and restored after the redirect, so all the user sees is a short flash.
+const RESUME_KEY = 'perch.resume';
+const RESUME_TTL = 10 * 60_000;
+
+function videoPlaying() {
+  const slot = viewer.isOpen && viewer.cur;
+  const v = slot && slot.video;
+  return !!(v && !v.paused && !v.ended && !v.error);   // an errored video keeps paused === false
+}
+
+/** Redirects for a silent renew when it's needed and allowed. Returns true when a redirect started. */
+function renewNow(reason) {
+  if (S.mode !== 'drive' || S.redirecting || !hasClientId() || !navigator.onLine) return false;
+  if (reason !== '401' && tokenLeft() > RENEW_AHEAD) return false;   // plenty of time left
+  if (videoPlaying()) { S.renewWhenIdle = true; return false; }      // never interrupt playback
+  if (!canTrySilent()) return false;                                 // one attempt per 2 minutes
+  saveUiState();
+  S.redirecting = true;
+  setNotice('Refreshing…');
+  signIn({ silent: true });
+  return true;
+}
+
+/** Drive said 401. Renew silently; the Reconnect pill is only the fallback. */
+function onAuthExpired() {
+  if (S.mode !== 'drive' || S.redirecting) return;
+  expireToken();
+  if (renewNow('401') || S.renewWhenIdle) return;
+  if (navigator.onLine) onAuthLost();
+  else setNotice('Offline · saved library');
+}
+
+function onResume() {
+  if (document.hidden || S.mode !== 'drive' || S.redirecting) return;
+  if (S.renewWhenIdle && !videoPlaying()) S.renewWhenIdle = false;
+  renewNow('resume');
+}
+
+/** Interactive sign-in (with login_hint), UI state saved like any renew. */
+function reconnect() {
+  saveUiState();
+  S.redirecting = true;
+  signIn({ silent: false });
+}
+
+function saveUiState() {
+  const st = {
+    t: Date.now(),
+    modeKey: S.modeKey,
+    libId: S.lib ? S.lib.id : null,
+    view: S.view,
+    search: S.search.active ? { q: S.search.q, tags: S.search.tags, scroll: S.search.scroll || 0 } : null,
+    scrollY: Math.round(scrollY),
+  };
+  const slot = viewer.isOpen && viewer.cur;
+  if (slot && slot.item) {
+    st.viewer = { id: slot.item.id };
+    const v = slot.video;
+    if (v) {
+      const r = S.resumeVideo && S.resumeVideo.id === slot.item.id ? S.resumeVideo : null;
+      st.viewer.video = r ? { t: r.t, playing: r.playing } : { t: slot.lastTime != null ? slot.lastTime : v.currentTime, playing: !v.paused };
+    }
+  }
+  lsSet(RESUME_KEY, st);
+}
+
+function takeResume(lib) {
+  const st = lsGet(RESUME_KEY);
+  if (!st) return null;
+  lsSet(RESUME_KEY, null);
+  if (Date.now() - st.t > RESUME_TTL || st.modeKey !== S.modeKey || st.libId !== lib.id) return null;
+  return st;
+}
+
+/** Put search, scroll position and the open viewer (and its video time) back exactly. */
+async function restoreUi(st) {
+  if (st.search) {
+    openSearch({ tags: st.search.tags || [], focus: false });
+    el.searchInput.value = st.search.q || '';
+    S.search.q = st.search.q || '';
+    S.search.scroll = st.search.scroll || 0;
+    renderSearch();
+  }
+  await nextFrame();
+  await nextFrame();
+  scrollTo(0, st.scrollY || 0);
+  if (st.viewer) {
+    const i = S.list.findIndex((it) => it.id === st.viewer.id);
+    if (i >= 0) viewer.open(S.list, i, null, { resume: st.viewer.video || null });
+  }
 }
 
 async function afterConnect() {
@@ -340,9 +454,11 @@ async function openLibrary(lib) {
   setThumbSource(S.drive);
   const snap = await kv.get(snapKey(lib.id)).catch(() => null);
   if (snap) {
-    applySnapshot(snap, { reveal: true });
+    const resume = takeResume(lib);
+    applySnapshot(snap, { reveal: !resume });
     showScreen('main');
-    runSync({ background: true });
+    if (resume) await restoreUi(resume);
+    if (S.mode !== 'drive' || tokenValid()) runSync({ background: true });
   } else {
     showSyncScreen(lib);
     runSync({ first: true });
@@ -396,7 +512,7 @@ async function runSync({ first = false, full = false, background = false } = {})
     setNotice(null);
   } catch (e) {
     if (S.lib !== lib) return;
-    if (e.name === 'AuthError') { onAuthLost(); if (first) showOnboarding(); return; }
+    if (e.name === 'AuthError') { onAuthExpired(); if (first && !S.redirecting) showOnboarding(); return; }
     console.warn('[perch] sync failed', e);
     if (first) showSyncError(e);
     else setNotice(navigator.onLine ? 'Couldn’t sync · Retry' : 'Offline · saved library', () => runSync());
@@ -417,7 +533,7 @@ function showSyncError(e) {
 }
 
 function handleFatal(e) {
-  if (e.name === 'AuthError') { onAuthLost(); showOnboarding(); return; }
+  if (e.name === 'AuthError') { onAuthExpired(); if (!S.redirecting) showOnboarding(); return; }
   el.libsSub.textContent = e.message || 'Something went wrong';
 }
 
@@ -425,15 +541,17 @@ function onAuthLost() {
   if (S.mode !== 'drive') return;
   S.authLost = true;
   expireToken();
-  setNotice('Reconnect Google Drive', () => signIn());
+  setNotice('Reconnect Google Drive', reconnect);
 }
 
 function setNotice(text, action) {
-  if (!text) { el.notice.hidden = true; return; }
+  if (!text) { if (!el.notice.hidden) { el.notice.hidden = true; requestAnimationFrame(() => { grid.measureTop(); measureHero(); }); } return; }
+  const shown = el.notice.hidden;
   el.notice.hidden = false;
   el.notice.replaceChildren(h('i', { class: 'dot' }), h('span', null, text));
   el.notice.onclick = action || null;
   el.notice.setAttribute('role', action ? 'button' : 'status');
+  if (shown) requestAnimationFrame(() => { grid.measureTop(); measureHero(); });
 }
 
 // ── model → screen ───────────────────────────────────────────────────────────
@@ -723,7 +841,7 @@ function exitDemo() {
 
 // ── search ───────────────────────────────────────────────────────────────────
 let searchLayer = 0;
-function openSearch({ tags = [] } = {}) {
+function openSearch({ tags = [], focus = true } = {}) {
   if (!S.model) return;
   if (isSheetOpen()) closeSheet();
   if (!S.search.active) {
@@ -742,7 +860,7 @@ function openSearch({ tags = [] } = {}) {
     S.search.tags = [...new Set([...S.search.tags, ...tags])];
   }
   renderSearch();
-  if (!tags.length) setTimeout(() => el.searchInput.focus(), 30);
+  if (focus && !tags.length) setTimeout(() => el.searchInput.focus(), 30);
 }
 
 function closeSearch({ fromHistory = false, silent = false } = {}) {
@@ -822,7 +940,9 @@ function toast(a, b) {
   toastTimer = setTimeout(() => el.toast.classList.remove('on'), 1700);
 }
 
+addEventListener('pageshow', (e) => { if (e.persisted) onResume(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden || S.screen !== 'main' || !S.snap) return;
+  if (!document.hidden) onResume();
+  if (document.hidden || S.redirecting || S.screen !== 'main' || !S.snap) return;
   if (Date.now() - S.snap.lastSync > 5 * 60_000 && (S.mode === 'demo' || tokenValid())) runSync({ background: true });
 });

@@ -12,6 +12,8 @@ It's a static PWA: install it from Safari/Chrome to the home screen and it behav
   - swipe between items, swipe down to dismiss
   - pinch and double-tap zoom
   - MP4/MOV/WebM stream with seeking (no full download)
+  - frame-by-frame stepping while paused (the frame rate is measured from the video itself)
+  - a rotate button for landscape media: real orientation lock on Android/Chrome (works with the system rotation lock on), a 90° CSS rotation elsewhere
   - GIFs animate
   - Vimeo/YouTube links embed
   - an info sheet with palette (tap to copy hex), tags, folders, source and notes
@@ -29,6 +31,7 @@ js/mockdrive.js  in-browser Drive mock used by demo mode (same code path as prod
 js/auth.js       Google OAuth (implicit flow, full-page redirect)
 js/grid.js       virtualized masonry
 js/viewer.js     fullscreen viewer, gestures, video controls, info sheet
+js/framestep.js  frame-rate detection and exact one-frame stepping
 js/sheet.js      bottom sheets      js/thumbs.js  thumbnail cache      js/store.js  IndexedDB + SW values
 icons/           app icons (tools/make_icons.py)
 demo/            synthetic Eagle libraries + manifest for demo mode
@@ -53,6 +56,7 @@ Open <http://localhost:8780>. The server supports HTTP Range so video seeking wo
 | `/?demo=1&latency=40` | sets the mock's network latency (ms) |
 | `/?demo=<url-of-manifest.json>` | any other mock manifest |
 | `/?install=ios\|ios-inapp\|android\|android-noprompt` | forces an "Install as app" variant (dev hosts only: `localhost`, `*.localhost`) |
+| `/?rotate=css` | forces the CSS fallback of the rotate button (dev hosts only) |
 
 To test against a copy of a real library without putting it in the app folder:
 
@@ -110,7 +114,7 @@ How caching works: the app page and `config.js` load network-first and fall back
 - **Access:**
   - Scope is `drive.readonly`. Perch never writes to Drive or Eagle.
   - The OAuth token lives in this browser only: localStorage, plus the Cache API so the service worker can stream video.
-  - Tokens expire after an hour. Perch renews them with a silent redirect, or shows **Reconnect**.
+  - Tokens expire after an hour and there is no refresh token. Perch renews silently (`prompt=none` with `login_hint` = the account's email, learned from Drive after sign-in) at launch, on resume when under 10 minutes are left, and after any 401. It saves the screen state first (library, folder, search, scroll, open item, video time) and restores it after the redirect. At most one silent attempt per 2 minutes. **Reconnect** only appears when Google says the user must act (`interaction_required`, `login_required`, `consent_required`, `account_selection_required`).
   - **Sign out** revokes the token and deletes all cached data on the device.
 - **Folder passwords:** compared on-device against the value Eagle stores in `metadata.json`.
 - **Not supported yet:** smart folders (their rules aren't evaluated).

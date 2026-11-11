@@ -88,5 +88,10 @@ export function createDrive({ backend, getToken = () => null, onAuthError = () =
     },
     /** Raw media Response (for progress-tracked downloads). */
     raw: (id) => media(id),
+    /** Email of the signed-in Drive account (used as login_hint when renewing the token). */
+    async about() {
+      const j = await (await request('about', { fields: 'user(emailAddress)' })).json();
+      return j?.user?.emailAddress || '';
+    },
   };
 }

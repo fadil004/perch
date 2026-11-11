@@ -456,7 +456,11 @@ h1, h2, p { margin: 0; }
 .search-tags::-webkit-scrollbar { display: none; }
 .search-tags:empty { display: none; }
 
-body.searching .hero, body.searching .topbar { display: none; }
+body.searching .topbar { display: none; }
+/* In search the header collapses, but a notice (Reconnect, Offline) stays visible under the search bar. */
+body.searching .hero { padding: 0 calc(16px + var(--sar)) 0 calc(16px + var(--sal)); }
+body.searching .hero > :not(.notice) { display: none; }
+body.searching .notice { margin: 2px 0 10px; }
 body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 
 .suggest {
@@ -678,6 +682,9 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   white-space: nowrap;
 }
 
+.v-msg.act { pointer-events: auto; color: #fff; font: inherit; font-size: 14px; font-weight: 600; box-shadow: inset 0 0 0 .5px rgba(255,255,255,.2); transition: transform 140ms var(--ease-out); }
+.v-msg.act:active { transform: translate(-50%, -50%) scale(.96); }
+
 .v-pulse {
   position: absolute;
   left: 50%; top: 50%;
@@ -716,7 +723,20 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .v-btn:active { background: rgba(255,255,255,.12); transform: scale(.92); }
 .v-btn svg { width: 22px; height: 22px; }
 .v-btn.on { background: rgba(255, 255, 255, .16); }
-.v-counter { font-size: 13px; font-weight: 500; color: rgba(255,255,255,.82); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+.v-counter { position: absolute; left: 50%; transform: translateX(-50%); font-size: 13px; font-weight: 500; color: rgba(255,255,255,.82); font-variant-numeric: tabular-nums; letter-spacing: .02em; }
+.v-right { display: flex; align-items: center; }
+
+/* Rotate fallback: the whole stage turns 90°, so its edges map to other safe areas of the screen. */
+.viewer.rot {
+  inset: auto;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  --sat: env(safe-area-inset-right, 0px);
+  --sar: env(safe-area-inset-bottom, 0px);
+  --sab: env(safe-area-inset-left, 0px);
+  --sal: env(safe-area-inset-top, 0px);
+}
 .v-bottom {
   position: absolute;
   left: 0; right: 0; bottom: 0;
@@ -740,6 +760,50 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .vc-fill { background: #fff; }
 .vc-knob { position: absolute; top: 50%; left: 0; width: 13px; height: 13px; margin: -6.5px 0 0 -6.5px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,.4); transform: scale(.62); transition: transform 160ms var(--ease-out); }
 .vc-scrub.active .vc-knob { transform: scale(1.1); }
+
+/* Frame step: sits just above the control row while the video is paused */
+.fs {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--sab) + 58px);
+  display: flex;
+  align-items: center;
+  height: 44px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, .46);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+  box-shadow: inset 0 0 0 .5px rgba(255, 255, 255, .16);
+  color: #fff;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, 6px) scale(.97);
+  transition: opacity 140ms var(--ease-out), transform 140ms var(--ease-out);
+}
+.fs.on { opacity: 1; pointer-events: auto; transform: translate(-50%, 0) scale(1); transition-duration: 200ms; }
+.fs-b {
+  width: 46px; height: 44px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  flex: none;
+  transition: background-color 140ms, transform 140ms var(--ease-out), opacity 160ms var(--ease-out);
+}
+.fs-b svg { width: 20px; height: 20px; }
+.fs-b:active { background: rgba(255, 255, 255, .14); transform: scale(.9); }
+.fs-b.dim { opacity: .3; }
+.fs-b.dim:active { background: none; transform: none; }
+.fs-t {
+  min-width: 60px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+  color: rgba(255, 255, 255, .92);
+  direction: ltr;
+  unicode-bidi: isolate;
+}
 
 .v-open {
   pointer-events: auto;
@@ -946,10 +1010,11 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   .wall-col { animation: none; }
   .tile-in, .dock, .chip, .btn-primary, .v-full { transition-duration: 1ms !important; }
   .searchbar.enter { animation: none; }
+  .fs, .fs.on { transform: translate(-50%, 0); }
 }
 
 @media (prefers-reduced-transparency: reduce) {
-  .topbar, .dock, .searchbar, .v-info, .toast { -webkit-backdrop-filter: none; backdrop-filter: none; background: #141416; }
+  .topbar, .dock, .searchbar, .v-info, .toast, .fs { -webkit-backdrop-filter: none; backdrop-filter: none; background: #141416; }
 }
 
 @media (hover: hover) and (pointer: fine) {
