@@ -18,8 +18,9 @@ const EASE = 'cubic-bezier(.2,.8,.2,1)';
 export const FOLDER_COLORS = { red: '#ff453a', orange: '#ff9f0a', yellow: '#ffd60a', green: '#32d74b', aqua: '#64d2ff', blue: '#0a84ff', purple: '#bf5af2', pink: '#ff375f' };
 
 export class Viewer {
-  constructor({ grid, media, getLibrary, onTag, onFolder, toast, canOpenDrive, onAuthNeeded, onReconnect, onClosed }) {
+  constructor({ grid, media, getLibrary, onTag, onFolder, toast, canOpenDrive, onAuthNeeded, onReconnect, onClosed, onDelete }) {
     this.onAuthNeeded = onAuthNeeded;
+    this.onDelete = onDelete;
     this.onReconnect = onReconnect;
     this.onClosed = onClosed;
     this.grid = grid;
@@ -55,6 +56,11 @@ export class Viewer {
     this.infoBtn = infoBtn;
     closeBtn.addEventListener('click', () => this.close());
     infoBtn.addEventListener('click', () => this.setInfo(this.infoQ < 0.5));
+    // Delete: the item leaves at once (Undo in a toast); main.js decides what happens to it.
+    const trashBtn = document.getElementById('v-trash');
+    trashBtn.innerHTML = I.trash;
+    trashBtn.hidden = !onDelete;
+    trashBtn.addEventListener('click', () => { if (this.isOpen && !this.closing && this.cur.item && this.onDelete) this.onDelete(this.cur.item); });
 
     // Rotate to landscape: real orientation lock where the browser allows it, CSS rotation otherwise.
     this.rot = null;          // null | 'lock' | 'css'
@@ -105,9 +111,21 @@ export class Viewer {
       else if (e.key === ' ' && this.cur?.video) { e.preventDefault(); this.togglePlay(); }
     });
     this.root.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
+    // The app went to the background: a video (with sound or not) must not keep playing there.
+    document.addEventListener('visibilitychange', () => {
+      const v = this.isOpen && this.cur?.video;
+      if (document.hidden && v && !v.paused) v.pause();
+    });
   }
 
   get cur() { return this.slots[1]; }
+
+  /** Index of the current item in the grid's list (which can differ from ours), or -1. */
+  gridIndex() {
+    const id = this.cur?.item?.id, L = this.grid.items;
+    if (id == null) return -1;
+    return L[this.index]?.id === id ? this.index : L.findIndex((x) => x.id === id);
+  }
 
   // The stage's own frame, measured from the viewer box itself. innerWidth/innerHeight are not trusted: while
   // Android turns back from a fullscreen landscape lock they briefly report a passing, zoomed-out viewport.
@@ -116,7 +134,8 @@ export class Viewer {
   get VH() { return this.root.clientHeight || (this.rot === 'css' ? innerWidth : innerHeight); }
   px(e) { return this.rot === 'css' ? e.clientY : e.clientX; }
   py(e) { return this.rot === 'css' ? innerWidth - e.clientX : e.clientY; }
-  satPx() { return this.satProbe.offsetHeight; }
+  // Read once per open/relayout (applyInfo runs every frame of a sheet drag).
+  satPx() { return this.sat ?? (this.sat = this.satProbe.offsetHeight); }
 
   // ── rotate ────────────────────────────────────────────────────────────────
   async toggleRotate() {
@@ -199,7 +218,7 @@ export class Viewer {
   fit(it) {
     const vw = this.VW, vh = this.VH;
     let w = it?.w, hh = it?.h;
-    if (!(w > 0 && hh > 0)) { w = 1; hh = 1; }
+    if (!(w > 0 && hh > 0)) { w = 1; hh = it?.ratio > 0 ? it.ratio : 1; }   // size unknown: the tile's ratio (h / w)
     const s = Math.min(vw / w, vh / hh);
     const fw = w * s, fh = hh * s;
     return { left: (vw - fw) / 2, top: (vh - fh) / 2, width: fw, height: fh };
@@ -228,9 +247,14 @@ export class Viewer {
   }
 
   relayout() {
+    this.sat = this.satProbe.offsetHeight;
     for (const s of this.slots) { this.positionSlot(s, s.pos); this.layoutSlot(s); }
     this.setZoom({ s: 1, x: 0, y: 0 });
-    if (this.infoQ > 0) this.applyInfo(this.infoQ);
+    // The sheet's height depends on the stage (64dvh, or 64% while CSS-rotated): measure it again, or a
+    // closed sheet measured while rotated would peek over the controls after turning back.
+    this.infoH = this.infoHeight();
+    if (this.infoQ > 0) { this.infoTouch(); this.applyInfo(this.infoQ); }
+    else this.info.style.transform = `translateY(${this.infoH + 24}px)`;
   }
 
   setSlot(slot, idx, pos) {
@@ -261,6 +285,7 @@ export class Viewer {
     if (slot.play) { slot.play.remove(); slot.play = null; }
     if (slot.msg) { slot.msg.remove(); slot.msg = null; }
     if (slot.blobUrl) { URL.revokeObjectURL(slot.blobUrl); slot.blobUrl = null; }
+    slot.loadingFull = false;
     slot.load.classList.remove('on');
     slot.resume = null;
     slot.lastTime = null;
@@ -269,6 +294,7 @@ export class Viewer {
     slot.media.style.backgroundColor = '';
     slot.media.classList.remove('clip');
     slot.zoom.style.transform = '';
+    slot.zoom.style.willChange = '';
   }
 
   // ── media per kind ────────────────────────────────────────────────────────
@@ -334,17 +360,25 @@ export class Viewer {
 
   async loadFull(slot) {
     const it = slot.item, tok = slot.tok;
+    if (slot.loadingFull || slot.full) return;   // already on its way (a neighbour's preload, then activate)
+    slot.loadingFull = true;
     try {
       const src = await this.mediaSrc.src(it.f.main, { size: it.size });
       if (slot.tok !== tok) { if (src.startsWith('blob:')) URL.revokeObjectURL(src); return; }
       if (src.startsWith('blob:')) slot.blobUrl = src;
       const img = h('img', { class: 'v-full', alt: '', draggable: 'false' });
-      img.onload = () => { if (slot.tok === tok) requestAnimationFrame(() => img.classList.add('in')); };
-      img.onerror = () => img.remove();
+      img.decoding = 'async';
       img.src = src;
+      // Decode off the main thread before it goes on screen, so a large original doesn't hitch a swipe.
+      try { await img.decode(); } catch { /* checked below */ }
+      if (slot.tok !== tok) return;
+      if (!img.complete || !img.naturalWidth) throw new Error('image failed');
       slot.zoom.append(img);
       slot.full = img;
+      getComputedStyle(img).opacity;   // start the fade from 0 (style only, no layout)
+      requestAnimationFrame(() => { if (slot.tok === tok) img.classList.add('in'); });
     } catch { /* thumbnail stays */ }
+    if (slot.tok === tok) slot.loadingFull = false;
   }
 
   progress(slot, p) {
@@ -352,20 +386,29 @@ export class Viewer {
     slot.load.classList.toggle('on', p < 1);
   }
 
-  fail(slot, e) {
+  fail(slot, e, mediaErr = null) {
     if (e && e.name === 'AuthError') {
       if (this.mediaSrc.refreshing && this.mediaSrc.refreshing()) this.showMsg(slot, 'Refreshing…');
       else this.showMsg(slot, 'Reconnect to play', () => this.onReconnect && this.onReconnect());
       return;
     }
+    // MEDIA_ERR_DECODE / MEDIA_ERR_SRC_NOT_SUPPORTED: a codec the phone can't play (ProRes, 10-bit HEVC…).
+    if (navigator.onLine && mediaErr && (mediaErr.code === 3 || mediaErr.code === 4)) {
+      const id = slot.item && slot.item.f.main;
+      const drive = id && !id.startsWith('local:') && this.canOpenDrive();
+      this.showMsg(slot, 'This format can’t play on the phone', drive
+        ? () => window.open(`https://drive.google.com/file/d/${encodeURIComponent(id)}/view`, '_blank', 'noopener')
+        : undefined, 'Open in Drive');
+      return;
+    }
     this.showMsg(slot, navigator.onLine ? 'Couldn’t load this file' : 'You’re offline');
   }
 
-  showMsg(slot, text, action) {
+  showMsg(slot, text, action, actionLabel = '') {
     slot.load.classList.remove('on');
     if (slot.msg) slot.msg.remove();
     slot.msg = action
-      ? h('button', { class: 'v-msg act', type: 'button', onclick: (e) => { e.stopPropagation(); action(); } }, text)
+      ? h('button', { class: 'v-msg act', type: 'button', onclick: (e) => { e.stopPropagation(); action(); } }, text, actionLabel ? h('span', { class: 'v-msg-a' }, actionLabel) : null)
       : h('div', { class: 'v-msg' }, text);
     slot.el.append(slot.msg);
     if (slot === this.cur) this.fsSync();
@@ -376,7 +419,7 @@ export class Viewer {
     const it = slot.item;
     const auth = it && this.mediaSrc.authFailed ? await this.mediaSrc.authFailed(it.f.main) : false;
     if (slot.video !== v) return;
-    if (!auth) { this.fail(slot, this.mediaSrc.lastError ? this.mediaSrc.lastError() : null); return; }
+    if (!auth) { this.fail(slot, this.mediaSrc.lastError ? this.mediaSrc.lastError() : null, v.error); return; }
     this.showMsg(slot, 'Refreshing…');
     const t = v.currentTime > 0 ? v.currentTime : (slot.lastTime || 0);
     const playing = slot.playing;
@@ -417,6 +460,8 @@ export class Viewer {
     this.isOpen = true;
     this.closing = false;
     this.root.hidden = false;
+    this.root.style.pointerEvents = '';
+    this.sat = this.satProbe.offsetHeight;
     this.trackX = 0;
     this.setTrack(0);
     this.infoQ = 0;
@@ -428,7 +473,7 @@ export class Viewer {
     this.slots[1].resume = resume;
     this.updateChromeFor();
     this.setChrome(true, true);
-    this.grid.setGhost(index);
+    this.grid.setGhost(this.gridIndex());
     this.layerId = layers.push(() => this.close({ fromHistory: true }));
 
     const cur = this.cur, f = cur.fitRect;
@@ -462,10 +507,40 @@ export class Viewer {
     this.preloadNeighbours();
   }
 
+  /**
+   * The list changed under the open viewer (an item deleted, or put back): show `items[index]` without the
+   * open animation. An empty list closes the viewer.
+   */
+  reload(items, index) {
+    if (!this.isOpen || this.closing) return;
+    if (!items.length) { this.items = items; this.index = 0; this.close(); return; }
+    index = clamp(index, 0, items.length - 1);
+    if (this.rot || this.rotTry) this.exitRotation();
+    if (this.pageAnim) { this.pageAnim.stop(); this.pageAnim = null; }
+    if (this.infoQ > 0) this.applyInfo(0, true);
+    this.items = items;
+    this.index = index;
+    this.setTrack(0);
+    this.zoom = { s: 1, x: 0, y: 0 };
+    this.setSlot(this.slots[0], index - 1, -1);
+    this.setSlot(this.slots[1], index, 0);
+    this.setSlot(this.slots[2], index + 1, 1);
+    const cur = this.cur;
+    const thumbUrl = this.grid.thumbUrlAt(index);
+    if (thumbUrl && !cur.thumb.src) cur.thumb.src = thumbUrl;
+    if (!reducedMotion.matches) cur.media.animate([{ opacity: 0, transform: 'scale(.96)' }, { opacity: 1, transform: 'none' }], { duration: 220, easing: EASE });
+    this.updateChromeFor();
+    this.setChrome(true);
+    this.grid.setGhost(this.gridIndex());
+    this.activate(cur);
+    this.preloadNeighbours();
+  }
+
   /** Close back into the grid tile (or fade if the tile isn't available). */
   close({ velocity = 0, fromHistory = false } = {}) {
     if (!this.isOpen || this.closing) return;
     this.closing = true;
+    this.root.style.pointerEvents = 'none';   // the closing spring must not eat taps meant for the grid
     const wasRotated = !!(this.rot || this.rotTry);
     if (wasRotated) this.exitRotation();
     if (this.openAnim) { this.openAnim.finish(); }
@@ -479,9 +554,11 @@ export class Viewer {
     if (!fromHistory) layers.remove(this.layerId);
 
     const f = cur.fitRect;
-    this.grid.ensureVisible(this.index);
-    this.grid.setGhost(this.index);
-    const rect = wasRotated ? null : this.grid.tileRect(this.index);
+    // The grid's list may have changed while the viewer was open: find this item's tile by id.
+    const gi = this.gridIndex();
+    this.grid.ensureVisible(gi);
+    this.grid.setGhost(gi);
+    const rect = wasRotated || gi < 0 ? null : this.grid.tileRect(gi);
     const live = liveTransform(cur.media);
     const z = { ...this.zoom };
     const bg0 = Number(getComputedStyle(this.bg).opacity) || 0;
@@ -534,11 +611,29 @@ export class Viewer {
     const W = this.VW + GAP;
     const target = -dir * W;
     if (reducedMotion.matches) { this.setTrack(target); if (dir) this.shift(dir); else this.setTrack(0); return; }
-    this.pageAnim = spring({
+    // Hand over to the next item once the track is within 2px (the spring's long tail is invisible), and
+    // let the last pixels settle on their own, so its video starts without waiting for that tail.
+    let handed = false;
+    const anim = (this.pageAnim = spring({
       from: this.trackX, to: target, velocity, response: 0.36, damping: 1, precision: 0.4,
-      onUpdate: (v) => this.setTrack(v),
-      onDone: () => { this.pageAnim = null; if (dir) this.shift(dir); },
-    });
+      onUpdate: (v) => {
+        this.setTrack(v);
+        if (!dir || handed || Math.abs(v - target) >= 2) return;
+        handed = true;
+        const vel = anim ? anim.velocity || 0 : 0;
+        if (anim) anim.stop();
+        if (this.pageAnim === anim) this.pageAnim = null;
+        this.shift(dir);
+        if (Math.abs(this.trackX) >= 0.5 && this.isOpen && !this.closing) {
+          this.pageAnim = spring({
+            from: this.trackX, to: 0, velocity: vel, response: 0.36, damping: 1, precision: 0.4,
+            onUpdate: (x) => this.setTrack(x),
+            onDone: () => { this.pageAnim = null; },
+          });
+        }
+      },
+      onDone: () => { if (handed) return; if (this.pageAnim === anim) this.pageAnim = null; if (dir) this.shift(dir); },
+    }));
   }
 
   shift(dir) {
@@ -567,11 +662,11 @@ export class Viewer {
     if (old.iframe) { old.iframe.remove(); old.iframe = null; }
     if (old.play) { old.play.remove(); old.play = null; }
     old.zoom.style.transform = '';
+    old.zoom.style.willChange = '';
     this.zoom = { s: 1, x: 0, y: 0 };
     this.activate(this.cur);
     this.updateChromeFor();
-    this.grid.ensureVisible(this.index);
-    this.grid.setGhost(this.index);
+    this.grid.setGhost(this.gridIndex());   // scrolling the grid to it waits for close()
     this.preloadNeighbours();
   }
 
@@ -580,21 +675,38 @@ export class Viewer {
       const it = s.item;
       if (it && (it.kind === 'image') && !s.full) this.loadFull(s);
     }
-    // Neighbouring videos: once this one has had a moment to start, get the next and previous ready.
+    // Neighbouring videos: once this one can play through (or after a while), get the next and previous
+    // ready, one request at a time.
     clearTimeout(this.prefetchTimer);
+    this.prefetchKick = null;
+    this.prefetchQ = [];
     if (this.mediaSrc.prefetch) {
-      this.prefetchTimer = setTimeout(() => {
-        if (!this.isOpen) return;
-        for (const s of [this.slots[2], this.slots[0]]) {
-          const it = s.item;
-          if (it && it.kind === 'video' && it.f.main) this.mediaSrc.prefetch(it.f.main, it.size || 0);
-        }
-      }, 1200);
+      const cur = this.cur, tok = cur.tok;
+      const kick = () => {
+        if (this.prefetchKick !== kick) return;
+        this.prefetchKick = null;
+        clearTimeout(this.prefetchTimer);
+        if (!this.isOpen || this.closing || this.cur !== cur || cur.tok !== tok) return;
+        this.prefetchQ = [this.slots[2], this.slots[0]].map((s) => s.item).filter((it) => it && it.kind === 'video' && it.f.main);
+        this.pumpPrefetch();
+      };
+      this.prefetchKick = kick;
+      this.prefetchTimer = setTimeout(kick, cur.item && cur.item.kind === 'video' ? 4000 : 1200);
     }
     for (const k of [this.index + 2, this.index - 2]) {
       const it = this.items[k];
       if (it) loadThumb(thumbIdOf(it));
     }
+  }
+
+  pumpPrefetch() {
+    if (this.prefetchBusy || !this.isOpen) return;
+    const it = this.prefetchQ.shift();
+    if (!it) return;
+    this.prefetchBusy = true;
+    let p;
+    try { p = this.mediaSrc.prefetch(it.f.main, it.size || 0); } catch { /* ignore */ }
+    Promise.resolve(p).catch(() => {}).then(() => { this.prefetchBusy = false; this.pumpPrefetch(); });
   }
 
   // ── chrome ────────────────────────────────────────────────────────────────
@@ -643,7 +755,9 @@ export class Viewer {
     const d = h('span', { class: 'vc-t' }, '0:00');
     const mute = h('button', { type: 'button', 'aria-label': 'Sound' });
     const root = h('div', { class: 'vc' }, play, t, scrub, d, mute);
-    this.vc = { root, play, t, buf, fill, knob, rail, scrub, d, mute };
+    this.vc = { root, play, t, buf, fill, knob, rail, scrub, d, mute, railW: 0, p: 0, sec: -1 };
+    // The knob moves with a transform over the rail's width, kept here rather than read every frame.
+    new ResizeObserver(() => { this.vc.railW = rail.offsetWidth; this.vcPaint(this.vc.p); }).observe(rail);
     play.addEventListener('click', (e) => { e.stopPropagation(); this.togglePlay(); });
     mute.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -659,7 +773,10 @@ export class Viewer {
       const r = rail.getBoundingClientRect();
       // In the CSS-rotated fallback the rail runs down the screen.
       const p = clamp(this.rot === 'css' ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width, 0, 1);
-      v.currentTime = p * v.duration;
+      // One seek at a time (each is a new Range request): while one runs, keep only the latest position.
+      this.scrubT = p * v.duration;
+      if (v.seeking) this.seekQ = this.scrubT;
+      else { this.seekQ = null; v.currentTime = this.scrubT; }
       this.vcPaint(p);
     };
     scrub.addEventListener('pointerdown', (e) => {
@@ -679,6 +796,9 @@ export class Viewer {
       this.scrubbing = false;
       scrub.classList.remove('active');
       const v = this.cur.video;
+      // Land exactly where the finger left the rail.
+      if (v && this.scrubT != null && Math.abs(v.currentTime - this.scrubT) > 1e-3) v.currentTime = this.scrubT;
+      this.scrubT = this.seekQ = null;
       if (v && this.wasPlaying) v.play().catch(() => {});
       this.scheduleChromeHide();
       this.fsSync();
@@ -719,6 +839,7 @@ export class Viewer {
 
   vcReset(it) {
     this.vc.t.textContent = '0:00';
+    this.vc.sec = 0;
     this.vc.d.textContent = it.duration ? fmtDuration(it.duration) : '0:00';
     this.vcPaint(0);
     this.vc.buf.style.transform = 'scaleX(0)';
@@ -726,8 +847,10 @@ export class Viewer {
   }
 
   vcPaint(p) {
-    this.vc.fill.style.transform = `scaleX(${p})`;
-    this.vc.knob.style.left = `${p * 100}%`;
+    const vc = this.vc;
+    vc.p = p;
+    vc.fill.style.transform = `scaleX(${p})`;
+    vc.knob.style.translate = `${p * vc.railW}px 0`;   // own property: the knob's scale keeps its transition
   }
 
   vcSync() {
@@ -745,14 +868,26 @@ export class Viewer {
       if (!isCur()) return;
       if (v.duration && isFinite(v.duration)) {
         if (!this.scrubbing) this.vcPaint(v.currentTime / v.duration);
-        this.vc.t.textContent = fmtDuration(v.currentTime);
+        const sec = Math.round(v.currentTime);   // fmtDuration rounds too
+        if (sec !== this.vc.sec) { this.vc.sec = sec; this.vc.t.textContent = fmtDuration(v.currentTime); }
       }
       if (!v.paused) v._raf = requestAnimationFrame(tick);
     };
     slot.stepper = new FrameStepper(v, { key: slot.item.id, onUpdate: () => { if (isCur() && (v.paused || this.fs.on)) this.fsSync(); } });
     v.addEventListener('loadeddata', () => { if (slot.video === v) slot.vready = true; });
     for (const type of ['loadeddata', 'pause', 'play', 'seeked']) v.addEventListener(type, () => { if (isCur()) this.fsSync(); });
-    v.addEventListener('loadedmetadata', () => { if (isCur() && isFinite(v.duration)) this.vc.d.textContent = fmtDuration(v.duration); });
+    v.addEventListener('loadedmetadata', () => {
+      // Size unknown (a video sent from the phone): take it from the video and lay the slot out again.
+      const it = slot.item;
+      if (slot.video === v && it && !(it.w > 0 && it.h > 0) && v.videoWidth && v.videoHeight && !this.closing) {
+        it.w = v.videoWidth;
+        it.h = v.videoHeight;
+        this.layoutSlot(slot);
+        if (slot === this.cur) { this.updateRotateBtn(); if (this.infoQ > 0) this.applyInfo(this.infoQ); }
+      }
+      if (isCur() && isFinite(v.duration)) this.vc.d.textContent = fmtDuration(v.duration);
+    });
+    v.addEventListener('canplaythrough', () => { if (isCur() && this.prefetchKick) this.prefetchKick(); });
     v.addEventListener('play', () => { if (!isCur()) return; this.vcSync(); cancelAnimationFrame(v._raf); v._raf = requestAnimationFrame(tick); this.scheduleChromeHide(); });
     v.addEventListener('pause', () => { if (!isCur()) return; this.vcSync(); clearTimeout(this.chromeTimer); });
     v.addEventListener('waiting', () => { if (isCur()) slot.load.classList.add('on'); });
@@ -764,6 +899,12 @@ export class Viewer {
     });
     v.addEventListener('timeupdate', () => { if (slot.video === v && !v.error) slot.lastTime = v.currentTime; if (isCur() && v.paused) tick(); });
     v.addEventListener('seeking', () => { if (slot.video === v) slot.lastTime = v.currentTime; });
+    v.addEventListener('seeked', () => {
+      if (!isCur() || this.seekQ == null) return;
+      const t = this.seekQ;
+      this.seekQ = null;
+      v.currentTime = t;   // the latest scrub position, queued while the last seek ran
+    });
     // Play intent (survives a scrub and a failed load), for restoring after a token renew.
     v.addEventListener('play', () => { slot.playing = true; });
     v.addEventListener('pause', () => { if (!v.error && !this.scrubbing) slot.playing = false; });
@@ -809,11 +950,14 @@ export class Viewer {
   animateZoom(to, velocity = { x: 0, y: 0 }) {
     this.zoomAnim && this.zoomAnim.stop();
     const from = { ...this.zoom };
-    if (reducedMotion.matches) { this.setZoom(to); return; }
+    const el = this.cur.zoom;
+    // Settled: drop the layer hint so the image is drawn sharp again at its new scale.
+    if (reducedMotion.matches) { this.setZoom(to); el.style.willChange = ''; return; }
     this.zoomAnim = spring({
       from: 0, to: 1, response: 0.34, damping: 1, precision: 0.002,
       velocity: Math.abs(to.x - from.x) > 1 ? clamp(velocity.x / (to.x - from.x), -8, 8) : 0,
       onUpdate: (p) => this.setZoom({ s: lerp(from.s, to.s, p), x: lerp(from.x, to.x, p), y: lerp(from.y, to.y, p) }),
+      onDone: () => { el.style.willChange = ''; },
     });
   }
 
@@ -883,6 +1027,12 @@ export class Viewer {
     if (it.btime) kids.push(h('div', { class: 'i-sec' }, h('div', { class: 'i-label' }, 'Added'), h('div', { class: 'i-date' }, fmtDate(it.btime))));
     this.info.replaceChildren(...kids);
     this.info.scrollTop = 0;
+    this.infoTouch();
+  }
+
+  /** Let the browser pan the sheet only when there is something to scroll; otherwise the drag is ours. */
+  infoTouch() {
+    this.info.style.touchAction = this.info.scrollHeight > this.info.clientHeight + 1 ? 'pan-y' : 'none';
   }
 
   async copyHex(c) {
@@ -980,7 +1130,7 @@ export class Viewer {
 
     root.addEventListener('pointerdown', (e) => {
       if (!this.isOpen || this.closing) return;
-      if (e.target.closest('.v-btn, .vc, .fs, .v-open, .v-info, .v-play, .v-msg, iframe, a')) return;
+      if (e.target.closest('.v-btn, .vc, .fs, .v-open, .v-info, .v-play, .v-msg.act, iframe, a')) return;
       if (e.button > 0) return;
       pts.set(e.pointerId, { x: this.px(e), y: this.py(e) });
       try { root.setPointerCapture(e.pointerId); } catch { /* ignore */ }
@@ -989,6 +1139,7 @@ export class Viewer {
         if (!this.zoomable()) return;
         if (g && g.mode === 'page') this.go(0);
         this.zoomAnim && this.zoomAnim.stop();
+        this.cur.zoom.style.willChange = 'transform';   // pinch moves a layer instead of repainting the image
         g = { mode: 'pinch', d0: dist(), m0: mid(), z0: { ...this.zoom } };
         return;
       }
@@ -1003,8 +1154,9 @@ export class Viewer {
         else if (this.trackX > W / 2 && this.index > 0) this.shift(-1);
         trackFrom = this.trackX;
       }
+      const zoomCut = !!(this.zoomAnim && this.zoomAnim.running);
       this.zoomAnim && this.zoomAnim.stop();
-      g = { mode: null, x0: this.px(e), y0: this.py(e), t0: performance.now(), track0: trackFrom, z0: { ...this.zoom }, q0: this.infoQ, id: e.pointerId };
+      g = { mode: null, x0: this.px(e), y0: this.py(e), t0: performance.now(), track0: trackFrom, z0: { ...this.zoom }, q0: this.infoQ, id: e.pointerId, zoomCut };
       this.vel.reset();
       this.vel.add(this.px(e), this.py(e));
     });
@@ -1029,10 +1181,17 @@ export class Viewer {
       const dx = this.px(e) - g.x0, dy = this.py(e) - g.y0;
       if (!g.mode) {
         if (Math.hypot(dx, dy) < 8) return;
-        if (this.zoom.s > 1.01) g.mode = 'pan';
+        if (this.zoom.s > 1.01) { g.mode = 'pan'; this.cur.zoom.style.willChange = 'transform'; }
         else if (this.infoQ > 0.01) g.mode = Math.abs(dy) >= Math.abs(dx) ? 'info' : 'none';
         else if (Math.abs(dx) > Math.abs(dy) * 1.1) g.mode = 'page';
-        else if (dy > 0) { g.mode = 'dismiss'; this.setChrome(false); if (this.cur.video) this.cur.video.pause(); }
+        else if (dy > 0) {
+          g.mode = 'dismiss';
+          this.setChrome(false);
+          const v = this.cur.video;
+          g.resume = !!(v && !v.paused);   // a cancelled dismiss plays again only if it was playing
+          if (v) v.pause();
+          this.grid.ensureVisible(this.gridIndex());   // the grid shows through as the backdrop fades
+        }
         else g.mode = 'info';
         if (g.mode === 'info' && this.infoQ === 0) { this.renderInfo(); this.infoH = this.infoHeight(); }
         g.x0 = this.px(e); g.y0 = this.py(e);
@@ -1058,12 +1217,15 @@ export class Viewer {
       }
     });
 
-    const up = (e) => {
+    // A page spring cut by this touch must not leave two items half on screen.
+    const homeTrack = () => { if (!this.pageAnim && Math.abs(this.trackX) > 0.5) this.go(0); };
+    // pointercancel (an Android edge swipe, the system taking the touch over) ends the gesture with no tap.
+    const up = (e, cancelled = false) => {
       if (!pts.has(e.pointerId)) return;
       pts.delete(e.pointerId);
       if (!g) return;
       if (g.mode === 'pinch') {
-        if (pts.size === 0) { this.settleZoom(null); g = null; }
+        if (pts.size === 0) { this.settleZoom(null); homeTrack(); g = null; }
         else if (pts.size === 1) {
           // Continue as a pan with the remaining finger.
           const [p] = [...pts.entries()];
@@ -1075,9 +1237,18 @@ export class Viewer {
       if (e.pointerId !== g.id) return;
       const { vx, vy } = this.vel.get();
       const dx = this.px(e) - g.x0, dy = this.py(e) - g.y0;
-      const mode = g.mode;
-      const tap = !mode && performance.now() - g.t0 < 400;
+      const mode = g.mode, zoomCut = g.zoomCut, resume = g.resume;
+      const tap = !cancelled && !mode && performance.now() - g.t0 < 400;
       g = null;
+      if (mode !== 'page') homeTrack();
+      if (zoomCut && mode !== 'pan') this.settleZoom(null);   // a double-tap zoom stopped halfway
+      if (cancelled) {
+        if (mode === 'page') this.go(0);
+        else if (mode === 'dismiss') this.cancelDismiss(0, resume);
+        else if (mode === 'info') this.setInfo(this.infoQ > 0.5);
+        else if (mode === 'pan') this.settleZoom(null);
+        return;
+      }
       if (tap) { this.handleTap(this.px(e), this.py(e)); return; }
       if (mode === 'page') {
         const W = this.VW + GAP;
@@ -1088,7 +1259,7 @@ export class Viewer {
         this.go(dir, vx);
       } else if (mode === 'dismiss') {
         if ((dy > 110 && vy > -150) || vy > 650) this.close({ velocity: vy });
-        else this.cancelDismiss(vy);
+        else this.cancelDismiss(vy, resume);
       } else if (mode === 'info') {
         const Hs = this.infoH || this.infoHeight();
         const rest = this.infoQ - project(vy, 0.99) / Hs;
@@ -1097,8 +1268,8 @@ export class Viewer {
         this.settleZoom({ vx, vy });
       }
     };
-    root.addEventListener('pointerup', up);
-    root.addEventListener('pointercancel', up);
+    root.addEventListener('pointerup', (e) => up(e));
+    root.addEventListener('pointercancel', (e) => up(e, true));
   }
 
   handleTap(x, y) {
@@ -1135,7 +1306,7 @@ export class Viewer {
     this.bg.style.opacity = String(1 - Math.min(1, down / (vh * 0.5)));
   }
 
-  cancelDismiss(vy) {
+  cancelDismiss(vy, resume = false) {
     const cur = this.cur;
     const live = liveTransform(cur.media);
     const bg0 = Number(this.bg.style.opacity || 1);
@@ -1149,7 +1320,7 @@ export class Viewer {
       onDone: () => {
         cur.media.style.transform = '';
         this.setChrome(true);
-        if (cur.video && cur.video.paused) cur.video.play().catch(() => {});
+        if (resume && cur.video && cur.video.paused) cur.video.play().catch(() => {});
       },
     });
   }

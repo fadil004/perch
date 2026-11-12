@@ -165,13 +165,20 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
   for (const id of Object.keys(skipped)) if (!knownSet.has(id)) delete skipped[id];
 
   const stamp = (id) => (mtimes ? mtimes[id] : 0);
+  // skipped[id]: a stamp (number) = nothing to show for that version (deleted in Eagle, no id), skip until it
+  // changes; { m, t } = its folder or metadata.json wasn't on Drive yet (still syncing up): try again after a while.
+  const NOT_YET_RETRY = 10 * 60_000;
+  const notYet = (id) => { skipped[id] = { m: stamp(id), t: Date.now() }; };
   let need = known.filter((id) => {
     const it = items.get(id);
     if (it) return mtimes ? it._m !== mtimes[id] : false;
-    return !(id in skipped) || skipped[id] !== stamp(id);
+    const sk = skipped[id];
+    if (sk && typeof sk === 'object') return sk.m !== stamp(id) || Date.now() - sk.t > NOT_YET_RETRY;
+    return !(id in skipped) || sk !== stamp(id);
   });
   if (!listedInfos && need.some((id) => !infoMap[id])) infoMap = await listInfos();
-  for (const id of need) if (!infoMap[id]) skipped[id] = stamp(id); // listed in mtime.json but no folder on Drive
+  // Listed in mtime.json but no folder on Drive (yet): a known item keeps its old version, a new one waits.
+  for (const id of need) if (!infoMap[id] && !items.has(id)) notYet(id);
   need = need.filter((id) => infoMap[id]);
 
   const total = need.length;
@@ -189,7 +196,7 @@ export async function syncLibrary(drive, lib, prev, { full = false, onProgress =
     const files = children.get(infoMap[id]) || [];
     const metaFile = files.find((f) => f.name === 'metadata.json');
     try {
-      if (!metaFile) { skipped[id] = stamp(id); items.delete(id); return; }
+      if (!metaFile) { if (!items.has(id)) notYet(id); return; }   // not on Drive yet: a known item keeps its old version
       const raw = await drive.json(metaFile.id);
       netFails = 0;
       fetched++;

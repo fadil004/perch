@@ -1,10 +1,10 @@
 // Perch — boot, screens, sync orchestration, folders/search/more sheets.
-import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, fmtBytes, rubberband, reducedMotion, nextFrame } from './util.js';
+import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, fmtBytes, rubberband, reducedMotion, nextFrame, sleep } from './util.js';
 import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
 import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
-import { extractUrl, saveLink, recentLinks, siteOf } from './inbox.js';
-import { createUploader, stash, waiting } from './uploads.js';
+import { extractUrl, saveLink, saveDelete, newStem, recentLinks, siteOf } from './inbox.js';
+import { createUploader, stash, stashStream, waiting, clearWaiting } from './uploads.js';
 import { collectPending, notInLibrary } from './pending.js';
 import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError } from './bridge.js';
 import { createDrive, fetchBackend } from './drive.js';
@@ -37,13 +37,14 @@ const S = {
   swOk: false,
   pending: [],             // videos sent from the phone that Eagle hasn't added yet (js/pending.js)
   pendingStems: new Set(),
+  hidden: {},              // items deleted on this phone, until Eagle has trashed them: id → { stem, name, at, sent }
 };
 window.__perch = S; // handy for debugging in devtools
-const SHARE_KEY = 'perch.share';     // a link shared to Perch, kept until it's saved (survives a sign-in redirect)
+const SHARE_KEY = 'perch.share';     // links shared to Perch, kept until saved or downloaded (survive a sign-in redirect): [{ url, t, pc, job }]
+const SHARE_QUEUE_TTL = 24 * 60 * 60_000;
 const SHARE_TTL = 60 * 60_000;
 const SHARE_FILES_KEY = 'perch.share.files';   // videos just shared to Perch: show them uploading once the app is ready
 let uploader = null;                           // see up()
-const phoneClaims = new Map();                 // phone downloader job id → { p, listen }: its files being copied in (once, sheet open or not)
 
 const el = {
   onboard: $('#onboard'), libs: $('#libs'), syncing: $('#syncing'), main: $('#main'),
@@ -108,7 +109,8 @@ const media = {
     if (size > 30 * 1024 * 1024) return;
     const c = navigator.connection;
     if (c && (c.saveData || /(^|-)2g$/.test(c.effectiveType || ''))) return;
-    fetch(new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI), { headers: { 'X-Perch-Prefetch': '1', 'X-Perch-Size': String(size || 0) } }).catch(() => {});
+    // Resolves once the service worker has the whole file (the viewer prefetches one at a time); never hangs.
+    return fetch(new URL(`media/${encodeURIComponent(fileId)}`, document.baseURI), { headers: { 'X-Perch-Prefetch': '1', 'X-Perch-Size': String(size || 0) }, signal: AbortSignal.timeout(60000) }).catch(() => {});
   },
   lastError: () => (S.mode === 'drive' && !tokenValid() ? { name: 'AuthError' } : null),
   /** A video failed: was it the token? Asks the service worker's media route for one byte. */
@@ -157,9 +159,19 @@ const viewer = new Viewer({
   },
   onReconnect: () => reconnect(),
   onClosed: () => {
-    if (S.renewWhenIdle) { S.renewWhenIdle = false; renewSoon('idle'); }
+    if (S.renewWhenIdle && !S.shareOpen) { S.renewWhenIdle = false; renewSoon('idle'); }
+    if (S.snapLater) {
+      // A sync finished while the viewer was open: the grid changes now, not under the viewer.
+      const snap = S.snapLater;
+      S.snapLater = null;
+      S.deletesDirty = S.pendingDirty = false;
+      applySnapshot(snap, { keepScroll: true });
+      return;
+    }
+    if (S.deletesDirty) { S.deletesDirty = false; S.pendingDirty = false; rebuildModel(); }
     if (S.pendingDirty) { S.pendingDirty = false; showPending(); }
   },
+  onDelete: (it) => deleteItem(it),
 });
 
 function openViewer(i, tile) {
@@ -172,6 +184,8 @@ boot().catch((e) => { console.error(e); toast(e.message || 'Something went wrong
 
 async function boot() {
   const swReady = registerServiceWorker();
+  // Installed apps get persistent storage: videos not uploaded yet and the library cache survive storage pressure.
+  try { navigator.storage?.persist?.().catch(() => {}); } catch { /* not offered */ }
   const params = new URLSearchParams(location.search);
   takeSharedLink(params);
   // The phone downloader's installer opens Perch with #bridge=<token>. Asking it right away also brings up
@@ -257,7 +271,8 @@ async function startDrive(red) {
   setThumbSource(S.drive);
   // Expired or nearly: renew in the hidden frame first (about a second; the app never leaves the screen).
   // Only when that can't work does the page redirect below.
-  if (!red && tokenLeft() <= RENEW_AHEAD) await renewQuiet('start', { timeout: 5000 });
+  // A cold start loads Google's page slowly: give the frame longer than a renew mid-session gets.
+  if (!red && tokenLeft() <= RENEW_AHEAD) await renewQuiet('start', { timeout: 7000 });
   if (tokenValid()) {
     scheduleRenew();
     await swkv.set('auth', getAuth());
@@ -314,7 +329,7 @@ async function forgetLibraries() {
   console.info('[perch] different Google account: clearing the cached library');
   try {
     for (const k of Object.keys(localStorage)) {
-      if (k === 'perch.lib.drive' || k === RESUME_KEY || k.startsWith('perch.view.drive.') || k.startsWith('perch.pasted.drive') || k.startsWith('perch.inbox.') || k.startsWith('perch.pending.')) localStorage.removeItem(k);
+      if (k === 'perch.lib.drive' || k === RESUME_KEY || k.startsWith('perch.view.drive.') || k.startsWith('perch.pasted.drive') || k.startsWith('perch.inbox.') || k.startsWith('perch.pending.') || k.startsWith('perch.lastSync.drive')) localStorage.removeItem(k);
     }
   } catch { /* storage unavailable */ }
   try { sessionStorage.removeItem('perch.unlocked'); } catch { /* ignore */ }
@@ -347,10 +362,14 @@ function renewQuiet(reason, { timeout } = {}) {
   quietP = renewInFrame({ timeout }).then(async (r) => {
     if (r.ok) {
       await swkv.set('auth', getAuth());
+      const wasLost = S.authLost;
       S.authLost = false;
-      if (S.screen === 'main' && /Reconnect|Refreshing|refresh sign-in/.test(el.notice.textContent || '')) setNotice(null);
+      if (S.screen === 'main' && /Reconnect|Refreshing|refresh sign-in|Offline/.test(el.notice.textContent || '')) setNotice(null);
       scheduleRenew();
       console.info(`[perch] token renewed in the background (${reason})`);
+      // Sign-in was lost meanwhile: catch up on what was missed.
+      if (wasLost && S.screen === 'main' && reason !== 'start') { runSync({ background: true }); refreshPending(); }
+      if (uploader && S.screen === 'main') uploader.retrySoft();   // uploads that failed on the old token
       return true;
     }
     console.info(`[perch] background renew failed (${reason}): ${r.error}`);
@@ -379,7 +398,7 @@ function scheduleRenew() {
 function renewNow(reason) {
   if (S.mode !== 'drive' || S.redirecting || !hasClientId() || !navigator.onLine) return false;
   if (reason !== '401' && tokenLeft() > RENEW_AHEAD) return false;   // plenty of time left
-  if (videoPlaying()) { S.renewWhenIdle = true; return false; }      // never interrupt playback
+  if (videoPlaying() || S.shareOpen) { S.renewWhenIdle = true; return false; }   // never interrupt playback or a link being typed
   if (!canTrySilent()) return false;                                 // one attempt per 2 minutes
   saveUiState();
   S.redirecting = true;
@@ -544,16 +563,16 @@ function showSetupNote() {
 }
 
 // ── libraries ────────────────────────────────────────────────────────────────
-async function showLibraries() {
+async function showLibraries({ noAuto = false } = {}) {
   showScreen('libs');
   el.libList.replaceChildren();
   el.libsSub.textContent = 'Looking for Eagle libraries…';
   try {
     S.libs = withPasted(await discoverLibraries(S.drive));
   } catch (e) {
-    return handleFatal(e);
+    return handleFatal(e, { noAuto });
   }
-  if (S.libs.length === 1) return openLibrary(S.libs[0]);
+  if (S.libs.length === 1 && !noAuto) return openLibrary(S.libs[0]);
   renderLibraryList();
 }
 
@@ -611,18 +630,23 @@ function withPasted(libs) {
 }
 
 const snapKey = (libId) => `snap:${S.modeKey}:${libId}`;
+// A sync that changed nothing doesn't rewrite the snapshot; only its time is kept, here.
+const lastSyncKey = (libId) => `perch.lastSync.${S.modeKey}.${libId}`;
 
 async function openLibrary(lib) {
   S.lib = lib;
+  S.hidden = lsGet(hiddenKey(lib.id), {}) || {};
   S.pending = [];
   S.pendingSig = '';
   S.pendingStems = new Set();
   lsSet(`perch.lib.${S.modeKey}`, lib);
   S.view = lsGet(`perch.view.${S.modeKey}.${lib.id}`, { type: 'all' });
   S.snap = null;
+  S.snapLater = null;
   S.model = null;
   setThumbSource(S.drive);
   const snap = await kv.get(snapKey(lib.id)).catch(() => null);
+  if (snap) snap.lastSync = Math.max(snap.lastSync || 0, Number(lsGet(lastSyncKey(lib.id))) || 0);
   if (snap) {
     const resume = takeResume(lib);
     applySnapshot(snap, { reveal: !resume });
@@ -671,17 +695,26 @@ async function runSync({ first = false, full = false, background = false } = {})
   const current = () => S.lib && S.lib.id === lib.id;
   if (!first) el.spin.hidden = false;
   try {
-    const { snap, stats } = await syncLibrary(S.drive, lib, full ? null : S.snap, { full, onProgress: first ? (p) => { if (current()) firstSyncProgress(p); } : () => {} });
+    const base = S.snapLater || S.snap;   // a snapshot waiting for the viewer to close is the newest
+    const { snap, stats } = await syncLibrary(S.drive, lib, full ? null : base, { full, onProgress: first ? (p) => { if (current()) firstSyncProgress(p); } : () => {} });
     if (!current()) return;
     console.info('[perch] sync', stats);
     S.lastStats = stats;
-    await kv.set(snapKey(lib.id), snap).catch((e) => console.warn('[perch] could not cache library', e));
-    const changed = first || full || stats.fetched > 0 || stats.removed > 0 || !S.snap || snap.metaModified !== S.snap.metaModified;
+    const changed = first || full || stats.fetched > 0 || stats.removed > 0 || !base || snap.metaModified !== base.metaModified;
+    // Write the (large) snapshot only when something in it changed; otherwise just note the time.
+    const dirty = changed || snap.tagsModified !== base.tagsModified || stats.skipped !== Object.keys(base.skipped || {}).length;
+    if (dirty) await kv.set(snapKey(lib.id), snap).catch((e) => console.warn('[perch] could not cache library', e));
+    else lsSet(lastSyncKey(lib.id), snap.lastSync);
     if (first) {
       applySnapshot(snap, { reveal: true });
       showScreen('main');
+    } else if (changed && viewer.isOpen) {
+      S.snapLater = snap;   // applied when the viewer closes (the grid mustn't change under it)
     } else if (changed) {
+      S.snapLater = null;
       applySnapshot(snap, { keepScroll: true });
+    } else if (S.snapLater) {
+      S.snapLater = snap;
     } else {
       S.snap = snap;
     }
@@ -715,18 +748,21 @@ function showSyncError(e) {
   el.syncCount.replaceChildren(
     h('span', null, e.message || 'Sync failed'), h('br'),
     h('button', { class: 'btn-quiet', type: 'button', style: { height: '40px', marginTop: '8px' }, onclick: () => { showSyncScreen(S.lib); runSync({ first: true }); } }, 'Try again'),
-    h('button', { class: 'btn-quiet', type: 'button', style: { height: '40px', marginTop: '8px', marginLeft: '12px' }, onclick: () => showLibraries() }, 'Libraries'));
+    h('button', { class: 'btn-quiet', type: 'button', style: { height: '40px', marginTop: '8px', marginLeft: '12px' }, onclick: () => showLibraries({ noAuto: true }) }, 'Libraries'));
 }
 
-function handleFatal(e) {
-  if (e.name === 'AuthError') { onAuthExpired().then((ok) => { if (ok) { if (mayRetryAuth()) showLibraries(); } else if (!S.redirecting) showOnboarding(); }); return; }
-  el.libsSub.textContent = e.message || 'Something went wrong';
+function handleFatal(e, { noAuto = false } = {}) {
+  if (e.name === 'AuthError') { onAuthExpired().then((ok) => { if (ok) { if (mayRetryAuth()) showLibraries({ noAuto }); } else if (!S.redirecting) showOnboarding(); }); return; }
+  el.libsSub.replaceChildren(h('span', null, e.message || 'Something went wrong'), h('br'),
+    h('button', { class: 'btn-quiet', type: 'button', style: { height: '40px', marginTop: '8px' }, onclick: () => showLibraries({ noAuto }) }, 'Try again'));
 }
 
 function onAuthLost() {
   if (S.mode !== 'drive') return;
   S.authLost = true;
   expireToken();
+  // Offline, Google's page can't load: say so; back online it renews quietly (see the 'online' listener).
+  if (!navigator.onLine) { setNotice('Offline · saved library'); return; }
   setNotice('Reconnect Google Drive', reconnect);
 }
 
@@ -743,7 +779,8 @@ function setNotice(text, action) {
 // ── model → screen ───────────────────────────────────────────────────────────
 function applySnapshot(snap, { reveal = false, keepScroll = false } = {}) {
   S.snap = snap;
-  S.model = new Library(snap);
+  pruneHidden(snap);
+  S.model = libraryModel(snap);
   S.model.setUnlocked(S.unlocked);
   const v = S.view;
   if (v.type === 'folder' && (!S.model.folders.has(v.id) || S.model.isLocked(v.id))) S.view = { type: 'all' };
@@ -932,16 +969,29 @@ function unlockFolder(node) {
     saveUnlocked();
     S.model.setUnlocked(S.unlocked);
     render({ keepScroll: true });
-    if (S.model.isLocked(node.id)) { input.value = ''; err.textContent = 'This folder sits inside another locked folder'; return; }
+    if (S.model.isLocked(node.id)) {
+      // A locked folder inside: ask for that one next, by name.
+      const next = S.model.folderPath(node.id).find((f) => f.password && !S.unlocked.has(f.id)) || node;
+      input.value = '';
+      err.textContent = '';
+      const t = sheet.el.querySelector('.sheet-title');
+      if (t) t.textContent = next.name;
+      const sub = sheet.el.querySelector('.sheet-sub');
+      if (sub) sub.textContent = `Now enter the password for “${next.name}”`;
+      hint.textContent = next.tips ? `Hint: ${next.tips}` : '';
+      hint.hidden = !next.tips;
+      return;
+    }
     await closeSheet();
     selectView({ type: 'folder', id: node.id });
   };
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
   const lockOwner = S.model.folderPath(node.id).find((f) => f.password && !S.unlocked.has(f.id)) || node;
-  openSheet({
+  const hint = h('div', { class: 'hint', hidden: !lockOwner.tips }, lockOwner.tips ? `Hint: ${lockOwner.tips}` : '');
+  const sheet = openSheet({
     title: lockOwner.name,
     sub: 'This folder is locked in Eagle.',
-    body: h('div', { class: 'form' }, input, lockOwner.tips ? h('div', { class: 'hint' }, `Hint: ${lockOwner.tips}`) : null, err,
+    body: h('div', { class: 'form' }, input, hint, err,
       h('button', { class: 'btn-primary', type: 'button', onclick: go }, 'Unlock')),
   });
   setTimeout(() => input.focus(), 350);
@@ -1016,7 +1066,7 @@ async function openLibrarySwitcher() {
 /** "All" starts with them (they're the newest); never in folders or search, never next to the real item. */
 function withPending(list) {
   if (S.view.type !== 'all' || !S.pending.length || !S.model) return list;
-  return [...notInLibrary(S.pending, S.model.items), ...list];
+  return [...notInLibrary(S.pending.filter((it) => !S.hidden[it.id]), S.model.items), ...list];
 }
 
 /**
@@ -1028,17 +1078,20 @@ function refreshPending({ network = true } = {}) {
   if (!S.lib || !S.drive || S.redirecting) return Promise.resolve();
   if (S.pendingP) { S.pendingAgain = S.pendingAgain || (network ? 'net' : 'local'); return S.pendingP; }
   const lib = S.lib;
+  if (network) flushDeletes();
   S.pendingP = (async () => {
     const r = await collectPending({
       drive: S.drive, modeKey: S.modeKey, libName: lib.name, uploads: uploader ? uploader.list() : [],
       network: network && (S.mode === 'demo' || tokenValid()), token: S.mode === 'drive' ? token() : '',
     });
     if (S.lib !== lib) return;
+    settleDeletes(r);
     // Eagle added one: bring the real item in (it takes the pending tile's place).
     if (r.done.some((stem) => S.pendingStems.has(stem))) runSync({ background: true });
     S.pendingStems = new Set(r.items.map((it) => it.pending.stem));
     setPending(r.items);
-    if (await r.thumbs) S.pendingAgain = S.pendingAgain || 'local';   // Drive thumbnails arrived: show them
+    // New thumbnails (Drive's, or frames from the phone's copy) arrive in the background: show them then.
+    r.thumbs.then((got) => { if (got && S.lib === lib) refreshPending({ network: false }); });
   })().catch((e) => console.info('[perch] pending:', e.message)).finally(() => {
     S.pendingP = null;
     const again = S.pendingAgain;
@@ -1067,9 +1120,17 @@ function showPending() {
   if (S.screen === 'main' && S.model && !S.search.active && S.view.type === 'all') render({ keepScroll: true });
 }
 
-/** The upload queue moved: a new file on the phone shows at once; progress moves the tile's hairline. */
+/**
+ * The upload queue moved: a new file on the phone shows at once, a failed one says so; progress moves the
+ * tile's hairline. Runs at most once a frame (it's called on every upload progress event).
+ */
+let trackFrame = 0, trackLatest = [];
 function trackUploads(items) {
-  const ids = items.map((u) => u.id).join(',');
+  trackLatest = items;
+  if (!trackFrame) trackFrame = requestAnimationFrame(() => { trackFrame = 0; trackNow(trackLatest); });
+}
+function trackNow(items) {
+  const ids = items.map((u) => `${u.id}:${u.status}`).join(',');
   if (ids !== S.uploadIds) { S.uploadIds = ids; refreshPending({ network: false }); }
   const byId = new Map(items.map((u) => [u.id, u]));
   for (const it of S.pending) {
@@ -1077,6 +1138,159 @@ function trackUploads(items) {
     if (u && it.pending.upload) it.pending.upload = u.status === 'uploading' ? { sent: u.sent || 0, size: u.size || it.size } : { sent: 0, size: it.size };
   }
   grid.refreshMarks();
+}
+
+// ── delete from the phone ────────────────────────────────────────────────────
+// Perch can't touch the Eagle library (Drive is read-only for it), so a delete travels like a link: after the
+// Undo window a small request goes into the Perch Inbox and Video Grabber moves the item to Eagle's Trash.
+// Meanwhile the item stays hidden here (S.hidden, kept per library) until a sync no longer has it. A video
+// sent from the phone that Eagle hasn't added yet never reaches Eagle: its upload stops, or its files in the
+// inbox go to Drive's bin.
+const UNDO_MS = 5000;
+const DELETE_KEEP = 30 * 864e5;                 // never processed by Eagle: show the item again after this
+const hiddenKey = (libId) => `perch.deleted.${S.modeKey}.${libId}`;
+const undoTimers = new Map();                   // item id → timer of its Undo window
+
+/** The library model without what was deleted here, so All, folders, counts and search agree. */
+function libraryModel(snap) {
+  const items = snap.items.filter((it) => !S.hidden[it.id]);
+  return new Library(items.length === snap.items.length ? snap : { ...snap, items });
+}
+
+function rebuildModel() {
+  if (!S.snap) return;
+  S.model = libraryModel(S.snap);
+  S.model.setUnlocked(S.unlocked);
+  S.pendingDirty = false;
+  render({ keepScroll: true });
+}
+
+function saveHidden() { if (S.lib) lsSet(hiddenKey(S.lib.id), S.hidden); }
+
+/** After a sync: what Eagle has trashed is gone from the library, so it needn't be hidden any more. */
+function pruneHidden(snap) {
+  const ids = new Set(snap.items.map((it) => it.id));
+  let changed = false;
+  for (const [id, e] of Object.entries(S.hidden)) {
+    if (e.pending || undoTimers.has(id)) continue;   // phone videos are settled in settleDeletes()
+    if (!ids.has(id) || Date.now() - e.at > DELETE_KEEP) { delete S.hidden[id]; changed = true; }
+  }
+  if (changed) saveHidden();
+}
+
+function deleteItem(it) {
+  if (!canSend()) { askWrite({ files: false }); return; }   // Google's OK to write to Drive first, as for Save to Eagle
+  const id = it.id;
+  const entry = { name: it.name, at: Date.now(), sent: false };
+  if (it.pending) {
+    const local = it.f.main.startsWith('local:');
+    Object.assign(entry, { pending: it.pending.stem, local, video: local ? '' : it.f.main, req: it.pending.req || '' });
+  } else entry.stem = newStem();
+  const L = viewer.isOpen ? viewer.items : S.list;
+  const i = L.findIndex((x) => x.id === id);
+  const nextId = L[i + 1]?.id, prevId = L[i - 1]?.id;
+  S.hidden[id] = entry;
+  saveHidden();
+  rebuildModel();
+  if (viewer.isOpen) {
+    let j = S.list.findIndex((x) => x.id === nextId);
+    if (j < 0) j = S.list.findIndex((x) => x.id === prevId);
+    if (j < 0) j = Math.min(i, S.list.length - 1);
+    viewer.reload(S.list, j);
+  }
+  clearTimeout(undoTimers.get(id));
+  undoTimers.set(id, setTimeout(() => { undoTimers.delete(id); flushDeletes(); }, UNDO_MS));
+  toast('Deleted', undefined, { action: 'Undo', onAction: () => undoDelete(id), ms: UNDO_MS });
+}
+
+function undoDelete(id) {
+  const e = S.hidden[id];
+  if (!e || e.sent || !undoTimers.has(id)) return;   // too late: already on its way
+  clearTimeout(undoTimers.get(id));
+  undoTimers.delete(id);
+  delete S.hidden[id];
+  saveHidden();
+  rebuildModel();
+  if (viewer.isOpen) {
+    const j = S.list.findIndex((x) => x.id === id);
+    if (j >= 0) viewer.reload(S.list, j);
+  }
+}
+
+/**
+ * Send what's past its Undo window and not sent yet. Retried at launch, on resume, when back online and
+ * after each sync (with refreshPending); a failure (offline, sign-in expired) just waits for the next one.
+ */
+let flushing = null;
+function flushDeletes() {
+  if (flushing || !S.lib || !S.drive || S.redirecting || !canSend()) return flushing || Promise.resolve();
+  const lib = S.lib, hid = S.hidden, key = hiddenKey(lib.id);
+  const now = Date.now();
+  const due = [];
+  for (const [id, e] of Object.entries(hid)) {
+    if (e.sent || undoTimers.has(id)) continue;
+    if (now - e.at >= UNDO_MS) due.push([id, e]);
+    else undoTimers.set(id, setTimeout(() => { undoTimers.delete(id); flushDeletes(); }, UNDO_MS - (now - e.at)));   // left from before a reload
+  }
+  if (!due.length) return Promise.resolve();
+  flushing = (async () => {
+    for (const [id, e] of due) {
+      try {
+        if (e.pending) await removePending(e);
+        else await saveDelete(S.drive, S.modeKey, { stem: e.stem, item: id, name: e.name, library: lib });
+        if (hid[id] === e) { e.sent = true; lsSet(key, hid); }
+      } catch (err) {
+        console.info('[perch] delete not sent yet:', err.message);
+        if (err.name === 'AuthError' || (err.name === 'DriveError' && (err.status === 0 || err.status === 403))) break;
+      }
+    }
+  })().finally(() => { flushing = null; });
+  return flushing;
+}
+
+/** A phone video deleted before Eagle added it: stop it on the phone, or bin its files in the inbox. */
+async function removePending(e) {
+  const p = S.pending.find((x) => x.pending.stem === e.pending);
+  const local = p ? p.f.main.startsWith('local:') : e.local;
+  if (local) {
+    const uploaded = await up().cancel(e.pending);
+    if (uploaded) await binFile(uploaded);
+    return;
+  }
+  for (const id of [p ? p.f.main : e.video, p ? p.pending.req : e.req]) if (id) await binFile(id);
+}
+const binFile = (id) => S.drive.trash(id).catch((err) => { if (!(err.name === 'DriveError' && err.status === 404)) throw err; });   // 404: already gone
+
+/** What the inbox says about the deletes: Eagle couldn't do one → show the item again. */
+function settleDeletes(r) {
+  let changed = false;
+  const failed = [];
+  if (r.deletes) {
+    const byStem = new Map(r.deletes.map((d) => [d.stem, d]));
+    for (const [id, e] of Object.entries(S.hidden)) {
+      if (e.pending || !e.sent) continue;
+      if (byStem.get(e.stem)?.status === 'error') { delete S.hidden[id]; failed.push(e.name); changed = true; }
+    }
+  }
+  if (r.net) {
+    const live = new Map(r.items.map((it) => [it.pending.stem, it]));
+    let again = false;
+    for (const [id, e] of Object.entries(S.hidden)) {
+      if (!e.pending) continue;
+      const it = live.get(e.pending);
+      if (e.sent && !it) { delete S.hidden[id]; changed = true; }                    // gone from the phone and the inbox
+      else if (e.sent && !it.f.main.startsWith('local:') && (e.tries || 0) < 5) {
+        // It reached the inbox just as it was deleted: bin it there too.
+        Object.assign(e, { sent: false, local: false, video: it.f.main, req: it.pending.req || '', tries: (e.tries || 0) + 1 });
+        changed = again = true;
+      } else if (Date.now() - e.at > DELETE_KEEP) { delete S.hidden[id]; changed = true; }
+    }
+    if (again) setTimeout(flushDeletes, 0);
+  }
+  if (!changed) return;
+  saveHidden();
+  for (const name of failed) toast(`Couldn’t delete “${name}” in Eagle`);
+  if (failed.length) { if (viewer.isOpen) S.deletesDirty = true; else rebuildModel(); }
 }
 
 // ── send to Eagle ────────────────────────────────────────────────────────────
@@ -1102,8 +1316,8 @@ function up() {
 }
 
 /** First upload: Google asks once to let Perch create files (it only ever sees files it made). */
-function askWrite() {
-  lsSet(SHARE_FILES_KEY, Date.now());
+function askWrite({ files = true } = {}) {
+  if (files) lsSet(SHARE_FILES_KEY, Date.now());   // back from Google: carry on with the shared files
   saveUiState();
   S.redirecting = true;
   signIn({ write: true });
@@ -1120,24 +1334,287 @@ function takeSharedLink(params) {
   history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash);
   if (shared === 'failed') setTimeout(() => toast('Couldn’t receive what you shared'), 500);
   else if (shared && shared !== 'empty') lsSet(SHARE_FILES_KEY, Date.now());
-  else if (url) lsSet(SHARE_KEY, { url, t: Date.now() });
+  else if (url) queuePut(url, { fresh: true });   // joins any link still waiting: several shares in a row all count
   else setTimeout(() => toast('There was no link in what you shared'), 500);
+}
+
+// ── the share queue: links shared to Perch that aren't saved or downloaded yet ──────────────────────────
+// Kept in localStorage until the phone has the file or the link is saved for the computer, so nothing is
+// lost to a failed save, a sign-in redirect or Perch being closed. Entry: { url, t, pc, job, fresh }
+// (pc: goes to the computer; job: the phone downloader's job for it; fresh: not looked at yet).
+function shareQueue() {
+  let q = lsGet(SHARE_KEY);
+  if (q && !Array.isArray(q)) q = [q];   // one link, as saved before the queue
+  return (q || []).filter((e) => e && e.url && Date.now() - (e.t || 0) < SHARE_QUEUE_TTL);
+}
+function saveQueue(q) { lsSet(SHARE_KEY, q.length ? q : null); }
+function queuePut(url, patch = {}) {
+  const q = shareQueue();
+  const e = q.find((x) => x.url === url);
+  if (e) Object.assign(e, patch); else q.push({ url, t: Date.now(), ...patch });
+  saveQueue(q);
+}
+function queueDrop(url) { saveQueue(shareQueue().filter((x) => x.url !== url)); }
+const inQueue = (url) => shareQueue().some((x) => x.url === url);
+
+/** Something was just shared: "All" is where its tile shows. */
+function showAll() {
+  if (!S.model || S.screen !== 'main') return;
+  if (S.search.active || S.view.type !== 'all') selectView({ type: 'all' });
 }
 
 function handleSharedLink() {
   if (S.screen !== 'main' || S.redirecting) return;
   if (canSend()) up().run();
-  if (S.shareOpen) return;
   const files = lsGet(SHARE_FILES_KEY);
-  if (files) {
-    lsSet(SHARE_FILES_KEY, null);
-    if (Date.now() - files < SHARE_TTL) { openSaveLink(); return; }
+  if (files) lsSet(SHARE_FILES_KEY, null);
+  const newFiles = !!files && Date.now() - files < SHARE_TTL;
+  const q = shareQueue();
+  const fresh = q.filter((e) => e.fresh);
+  if (fresh.length) { for (const e of q) delete e.fresh; }
+  saveQueue(q);   // (also drops links too old to matter)
+  if (newFiles || fresh.length) showAll();
+  // Links download on this phone when the phone downloader is set up, otherwise they're saved for the computer.
+  if (paired()) resumeWatcher({ share: true });
+  if (canSend()) for (const e of q) if (e.pc || !paired()) sendToPc(e.url, '');
+  if (S.shareOpen) return;
+  // Show what's happening: new files or links, links waiting for Google's OK, or a download still going from before.
+  if (newFiles || fresh.length || q.some((e) => e.pc || !paired()) || (paired() && activeJobs().some((j) => Date.now() - j.t < SHARE_TTL))) openSaveLink();
+}
+
+// ── phone downloads, watched here whether the Save sheet is open or not ─────────────────────────────────
+// Each download in the phone downloader is an entry; the watcher polls it, copies the finished file into the
+// phone's storage, queues the upload and refreshes the tiles. The Save sheet only shows these entries.
+// Entry: { key, url, id, lib, state, text, p, title, kept, preview } with state 'start' | 'run' | 'copy' |
+// 'ready' | 'kept' (another Perch window has it) | 'error' (the link can't work) | 'retry' (copying failed:
+// the job is kept until the user retries or gives up).
+const W = { list: [], n: 0, listeners: new Set() };
+const wEmit = (ev = { type: 'list' }) => { for (const fn of W.listeners) fn(ev); };
+const wSet = (e, patch) => { Object.assign(e, patch); wEmit(); };
+const ENDED = new Set(['ready', 'kept', 'error']);
+function wDrop(e) {
+  e.state = 'gone';
+  W.list = W.list.filter((x) => x !== e);
+  wEmit();
+}
+
+let bridgeCheck = null;
+/** The phone downloader's status, asked once for the watcher and the sheet alike (fresh after a few seconds). */
+function bridgeStatus() {
+  if (!bridgeCheck || Date.now() - bridgeCheck.t > 4000) bridgeCheck = { t: Date.now(), p: paired() ? ping() : Promise.resolve(null) };
+  return bridgeCheck.p;
+}
+
+/** Downloads remembered from before (and shared links not started yet): watch them. On launch and resume. */
+function resumeWatcher({ share = false } = {}) {
+  if (!paired()) return;
+  for (const j of activeJobs()) watchJob(j);
+  const jobs = new Set(activeJobs().map((j) => j.id));
+  for (const e of shareQueue()) {
+    if (e.pc) continue;
+    if (e.job && !jobs.has(e.job)) { if (!W.list.some((x) => x.id === e.job)) queueDrop(e.url); continue; }   // handled before Perch closed
+    if (!e.job) watchLink(e.url, { cancellable: share });
   }
-  const p = lsGet(SHARE_KEY);
-  if (p && Date.now() - p.t <= SHARE_TTL) { openSaveLink({ url: p.url, auto: true, pc: !!p.pc }); return; }
-  if (p) lsSet(SHARE_KEY, null);
-  // A download on the phone that was still running when Perch closed: pick it up and finish it.
-  if (paired() && activeJobs().some((j) => Date.now() - j.t < SHARE_TTL)) openSaveLink();
+}
+
+/** Download a link on this phone. `cancellable`: closing the sheet before the job exists cancels it. */
+function watchLink(url, { cancellable = false } = {}) {
+  const same = W.list.find((x) => x.url === url && !ENDED.has(x.state));
+  if (same) return same;
+  const e = { key: `w${++W.n}`, url, id: '', lib: S.lib, state: 'start', text: 'Starting…', p: null, title: '', cancellable };
+  W.list.push(e);
+  wEmit();
+  startJob(e);
+  return e;
+}
+
+function watchJob({ id, url, lib }) {
+  if (W.list.some((x) => x.id === id)) return;
+  // The library it was shared into, not whichever is open now.
+  const e = { key: `w${++W.n}`, url, id, lib: lib ? { name: lib } : S.lib, state: 'run', text: 'Starting…', p: null, title: '' };
+  W.list.push(e);
+  wEmit();
+  pollJob(e);
+}
+
+async function startJob(e) {
+  const info = await bridgeStatus();
+  if (e.cancelled) { wDrop(e); queueDrop(e.url); return; }   // the sheet was closed first: the user didn't want it
+  if (e.state === 'gone') return;
+  if (!info) { giveUp(e, pingProblem() === 'auth' ? 'auth' : 'off'); return; }
+  try {
+    ({ id: e.id } = await startDownload(e.url));
+  } catch (err) {
+    giveUp(e, err.code === 'auth' ? 'auth' : err.code === 'off' ? 'off' : 'job', err.message);
+    return;
+  }
+  e.cancellable = false;
+  if (W.list.some((x) => x !== e && x.id === e.id)) { wDrop(e); return; }   // the bridge already had this link going
+  rememberJob(e.id, e.url, e.lib ? e.lib.name : '');
+  if (inQueue(e.url)) queuePut(e.url, { job: e.id });
+  pollJob(e);
+}
+
+async function pollJob(e) {
+  let misses = 0;
+  for (;;) {
+    if (e.state === 'gone') return;
+    let j;
+    try {
+      j = await getJob(e.id);
+      misses = 0;
+    } catch (err) {
+      if (e.state === 'gone') return;
+      if (err.code === 'notfound') {
+        // Gone from the bridge: kept by another Perch window (it forgets the job once it has the file), or lost.
+        if (activeJobs().some((x) => x.id === e.id)) giveUp(e, 'gone'); else keptElsewhere(e);
+        return;
+      }
+      if (err.code === 'auth') { giveUp(e, 'auth'); return; }
+      if (++misses >= 6) { giveUp(e, 'off'); return; }
+      await sleep(700);
+      continue;
+    }
+    if (e.state === 'gone') return;
+    if (j.title) e.title = j.title;
+    if (j.status === 'done') { claimJob(e, j); return; }
+    if (j.status === 'error') { jobFailed(e, j); return; }
+    const [text, p] = jobText(j);
+    wSet(e, { state: 'run', text, p });
+    await sleep(document.hidden ? 3000 : 700);
+  }
+}
+
+/** The phone couldn't: save the link for the computer instead (or keep it for that). */
+function giveUp(e, reason, detail = '') {
+  if (e.state === 'gone') return;
+  const why = reason === 'off' ? 'Phone downloader is off.'
+    : reason === 'auth' ? 'Phone downloader needs setting up again.'
+    : reason === 'gone' ? 'The download on the phone was lost.'
+    : reason ? `${String(detail || 'Couldn’t download it on this phone').replace(/[.!]?\s*$/, '.')}` : '';
+  if (inQueue(e.url)) queuePut(e.url, { pc: true, job: null });   // before the job is forgotten
+  if (e.id) { forgetJob(e.id); finishJob(e.id).catch(() => {}); }
+  wDrop(e);
+  if (reason === 'off' || reason === 'auth') { bridgeCheck = null; wEmit({ type: 'down' }); }
+  sendToPc(e.url, why, { ask: !why });
+}
+
+function jobFailed(e, j) {
+  // Links that can never work: just say so. Anything else may still work on the computer.
+  if (j.code !== 'unsupported' && j.code !== 'novideo') { giveUp(e, 'job', j.error); return; }
+  forgetJob(e.id);
+  finishJob(e.id).catch(() => {});
+  queueDrop(e.url);
+  wSet(e, { state: 'error', text: j.error || 'There’s no video to save here.', p: null });
+}
+
+function keptElsewhere(e) {
+  queueDrop(e.url);
+  wSet(e, { state: 'kept', text: 'Saved in another Perch window', p: 1 });
+}
+
+/** The download is done: copy it in (once, even with two Perch windows), then it uploads like any phone video. */
+async function claimJob(e, j) {
+  e.job = j;
+  wSet(e, { state: 'copy', text: 'Almost done', p: null });
+  try {
+    const kept = await claimOnce(e, j, (got, total) => wSet(e, { text: `Almost done · ${total ? Math.floor((100 * got) / total) : 0}%`, p: total ? got / total : null }));
+    if (e.state === 'gone') return;
+    if (!kept) { keptElsewhere(e); return; }
+    queueDrop(e.url);
+    wSet(e, { state: 'ready', title: j.title || kept[0].name, p: 1 });
+  } catch (err) {
+    if (e.state === 'gone') return;
+    if (err.code === 'novideo') { jobFailed(e, { code: 'novideo', error: err.message }); return; }
+    // Copying it in failed (cut off, or the phone is full): the downloader keeps its copy for another try.
+    console.warn('[perch] couldn’t copy the download in:', err.message);
+    wSet(e, { state: 'retry', text: err.name === 'QuotaExceededError' ? 'Not enough space on this phone' : 'Couldn’t copy it from the phone downloader', p: null });
+  }
+}
+
+/** Retry a download whose copy failed (asks the bridge again, then copies). */
+function retryJob(e) {
+  if (e.state !== 'retry') return;
+  wSet(e, { state: 'run', text: 'Starting…', p: null });
+  pollJob(e);
+}
+
+/**
+ * The installed app and a browser tab may both be watching the same job: only one copies it in. The other
+ * waits its turn and then finds the job already kept (null).
+ */
+function claimOnce(e, job, onProgress) {
+  const mine = () => (activeJobs().some((x) => x.id === e.id) ? copyIn(e, job, onProgress) : null);
+  return navigator.locks ? navigator.locks.request(`perch-bridge-${e.id}`, mine) : mine();
+}
+
+/**
+ * Copy a finished download from the phone downloader into the phone's storage (streamed, never in memory) and
+ * queue it for Drive (the source link goes with it, so Eagle records the website). Files already copied on an
+ * earlier try are kept. Only once everything is in does the downloader drop its copy.
+ */
+async function copyIn(e, job, onProgress) {
+  const list = (job && job.files) || [];
+  if (!list.length) throw new BridgeError('novideo', 'There’s no video to save here.');
+  const total = list.reduce((a, f) => a + (Number(f.size) || 0), 0);
+  e.kept = e.kept || {};
+  const t = Date.now();
+  let before = 0;
+  for (const [i, f] of list.entries()) {
+    if (!e.kept[f.n]) {
+      e.kept[f.n] = await fetchFile(e.id, f.n, (got) => onProgress(before + got, total), f,
+        (body, info) => stashStream(body, { ...info, url: e.url, library: e.lib, t: t + i }));
+      refreshPending({ network: false });   // its tile shows at once
+    }
+    before += e.kept[f.n].size;
+  }
+  const kept = list.map((f) => e.kept[f.n]);
+  e.preview = (kept.find((k) => /^video\//.test(k.type)) || kept[0]).blob;
+  forgetJob(e.id);
+  finishJob(e.id).catch(() => {});   // safely on this phone: the downloader can drop its copy
+  if (canSend()) up().run();
+  else if (S.shareOpen) askWrite();
+  return kept;
+}
+
+/**
+ * Save a link for the computer (Video Grabber downloads it). `why` says why the phone didn't. The link stays in
+ * the share queue until it's saved; the sheet, when open, shows the outcome (and puts a link that couldn't be
+ * saved back in the field). `ask`: may go to Google for the OK to write first.
+ */
+async function sendToPc(url, why = '', { ask = false } = {}) {
+  if (!S.shareOpen || inQueue(url)) queuePut(url, { pc: true, job: null });
+  const note = (state, msg = '') => wEmit({ type: 'pc', url, why, state, msg });
+  if (!canSend()) {
+    if (ask) { askWriteFor(url); return; }
+    note('wait', why);
+    return;
+  }
+  if (W.saving.has(url)) return;
+  W.saving.add(url);
+  note('saving');
+  try {
+    await saveLink(S.drive, S.modeKey, { url, library: S.lib });
+    queueDrop(url);
+    note('saved');
+    if (!S.shareOpen) toast('Saved for your computer');
+  } catch (e) {
+    const scope = e.name === 'DriveError' && e.status === 403 && /insufficient|scope|permission/i.test(e.message);
+    if (scope && (ask || S.shareOpen)) { askWriteFor(url); return; }
+    if (e.name === 'AuthError') note('auth', 'Google sign-in expired.');
+    else note('fail', e.message || 'Couldn’t save the link');
+  } finally {
+    W.saving.delete(url);
+  }
+}
+W.saving = new Set();
+
+/** First time: Google asks once to let Perch create files (it only ever sees files it made). The link waits in the queue. */
+function askWriteFor(link) {
+  queuePut(link, { pc: true, job: null });
+  saveUiState();
+  S.redirecting = true;
+  signIn({ write: true });
 }
 
 const LINK_STATUS = {
@@ -1149,30 +1626,38 @@ const LINK_STATUS = {
 };
 const FILE_STATUS = { ...LINK_STATUS, pending: 'Uploaded · waiting for Eagle on PC', queued: 'Adding to Eagle…', downloading: 'Adding to Eagle…', error: 'Couldn’t add' };
 
-function openSaveLink({ url = '', auto = false, pc = false } = {}) {
+function openSaveLink() {
   const writable = canSend();
   const libName = (S.lib?.name || '').replace(/\.library$/i, '');
-  const input = h('input', { class: 'field', type: 'url', placeholder: 'Paste a video link', value: url, autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
+  // A link that waits for the computer but can't be saved yet (Google's OK needed): ready in the field.
+  const waitingPc = writable ? null : shareQueue().find((e) => e.pc || !paired());
+  const input = h('input', { class: 'field', type: 'url', placeholder: 'Paste a video link', value: waitingPc ? waitingPc.url : '', autocomplete: 'off', autocapitalize: 'none', autocorrect: 'off', spellcheck: 'false', enterkeyhint: 'send' });
   const err = h('div', { class: 'err' });
   const saveBtn = h('button', { class: 'btn-primary', type: 'button' }, writable ? 'Save link' : 'Allow & save');
   const pcBtn = h('button', { class: 'btn-quiet dl-pc', type: 'button', hidden: true, onclick: () => save() }, 'Save for computer instead');
+  const reconnectBtn = h('button', { class: 'btn-quiet', type: 'button', hidden: true, onclick: () => {
+    // Keep the link (it's saved once Google is back) and reconnect.
+    const link = extractUrl(input.value);
+    if (link) queuePut(link, { pc: true, job: null });
+    reconnect();
+  } }, 'Reconnect');
   const linkNote = h('p', { class: 'link-note' });
   const recent = h('div', { class: 'link-list' });
   const done = h('div', { class: 'link-done', hidden: true });
   const uploads = h('div', { class: 'link-list' });
   const phoneList = h('div', { class: 'dl-list' });
   let closed = false;
+  let saving = false;   // a save is in flight: no second request from a second tap or Enter
 
   // ── the phone downloader (Termux): when it answers, a link downloads on this phone and the computer is
-  // the quiet alternative. Asked once per sheet; a download card waits for the same answer.
+  // the quiet alternative.
   let bridgeUp = false;
-  const bridgeP = paired() ? ping() : Promise.resolve(null);
-  bridgeP.then((info) => { if (!closed) { bridgeUp = !!info; linkMode(); } });
+  bridgeStatus().then((info) => { if (!closed) { bridgeUp = !!info; linkMode(); } });
   // The buttons wake up once there's something in the field: an empty field never says "not a link".
   const empty = () => !input.value.trim();
   function linkMode() {
-    saveBtn.textContent = bridgeUp ? 'Download' : writable ? 'Save link' : 'Allow & save';
-    saveBtn.disabled = pcBtn.disabled = empty();
+    saveBtn.textContent = saving ? 'Saving…' : bridgeUp ? 'Download' : writable ? 'Save link' : 'Allow & save';
+    saveBtn.disabled = pcBtn.disabled = saving || empty();
     pcBtn.hidden = !bridgeUp;
     linkNote.textContent = bridgeUp ? 'Downloads on this phone, then Eagle adds it.' : 'Video Grabber downloads it when Eagle is open on your computer.';
   }
@@ -1188,7 +1673,7 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     const files = [...picker.files];
     picker.value = '';
     if (!files.length) return;
-    try { await stash(files); } catch (e) { toast('Couldn’t read that file'); return; }
+    try { await stash(files, { library: S.lib }); } catch (e) { toast('Couldn’t read that file'); return; }
     if (canSend()) up().run(); else askWrite();
   });
 
@@ -1220,44 +1705,42 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
   }
   const onUploads = (items) => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => renderUploads(items)); };
 
-  // ── a link for the computer (Video Grabber downloads it). `why` says why the phone didn't.
+  // ── a link for the computer (Video Grabber downloads it).
   function showDone(title, sub) {
     done.hidden = false;
     done.replaceChildren(h('span', { class: 'ico', html: I.check }),
       h('div', null, h('div', { class: 'link-done-title' }, title), h('div', { class: 'link-done-sub' }, sub)));
   }
-  function askWriteFor(link) {
-    // First time: Google asks once to let Perch create files (it only ever sees files it made).
-    lsSet(SHARE_KEY, { url: link, t: Date.now(), pc: true });
-    saveUiState();
-    S.redirecting = true;
-    signIn({ write: true });
-  }
-  async function save(link = extractUrl(input.value), why = '') {
+  async function save(link = extractUrl(input.value)) {
+    if (saving) return;
     err.textContent = '';
+    reconnectBtn.hidden = true;
     if (!link) { if (!empty()) err.textContent = 'That doesn’t look like a link.'; return; }
-    if (!writable) { askWriteFor(link); return; }
-    saveBtn.disabled = pcBtn.disabled = true;
-    saveBtn.textContent = 'Saving…';
-    try {
-      await saveLink(S.drive, S.modeKey, { url: link, library: S.lib });
-      lsSet(SHARE_KEY, null);
-      if (extractUrl(input.value) === link) input.value = '';
-      if (why) showDone('Saved for your computer', `${why} Eagle downloads it the next time it’s open on your computer.`);
+    saving = true;
+    linkMode();
+    try { await sendToPc(link, '', { ask: true }); } finally { saving = false; if (!closed) linkMode(); }
+  }
+  /** How a link for the computer went (from this sheet or from the watcher). */
+  function onPc(n) {
+    if (n.state === 'saving') return;
+    if (n.state === 'saved') {
+      if (extractUrl(input.value) === n.url) input.value = '';
+      err.textContent = '';
+      reconnectBtn.hidden = true;
+      if (n.why) showDone('Saved for your computer', `${n.why} Eagle downloads it the next time it’s open on your computer.`);
       else showDone('Saved', `It downloads into ${libName ? `“${libName}”` : 'Eagle'} the next time Eagle is open on your computer.`);
       loadRecent();
-    } catch (e) {
-      const scope = e.name === 'DriveError' && e.status === 403 && /insufficient|scope|permission/i.test(e.message);
-      if (scope) { askWriteFor(link); return; }
-      err.textContent = e.name === 'AuthError' ? 'Google sign-in expired — try again.' : (e.message || 'Couldn’t save the link');
-    } finally {
-      saveBtn.disabled = pcBtn.disabled = false;
-      linkMode();
+    } else {
+      // Not saved: the link goes back in the field, ready for one tap (nothing is lost).
+      input.value = n.url;
+      err.textContent = n.msg || '';
+      reconnectBtn.hidden = n.state !== 'auth' || S.mode !== 'drive';
     }
+    linkMode();
   }
 
-  // ── a link downloaded on this phone
-  const cards = new Map();   // job id → card, so the same job never shows twice
+  // ── links downloading on this phone: cards over the watcher's entries
+  const cards = new Map();   // entry key → card
   const blobUrls = [];
   function download() {
     err.textContent = '';
@@ -1265,135 +1748,62 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     if (!link) { if (!empty()) err.textContent = 'That doesn’t look like a link.'; return; }
     input.value = '';
     linkMode();
-    phoneCard({ url: link });
+    watchLink(link, { cancellable: true });
   }
-  /** The phone couldn't (or the user chose the computer): save the link for Video Grabber instead. */
-  function phoneFailed(link, why) {
-    if (canSend() || !why) { save(link, why); return; }
-    // Saving for the computer needs Google's OK first: leave the link ready for one tap.
-    input.value = link;
-    linkMode();
-    err.textContent = why;
-  }
-  function phoneCard({ url: link, id = '' }) {
+  function card(e) {
     const head = h('div', { class: 'group-label' }, 'Downloading on this phone');
-    const title = h('div', { class: 'link-title', dir: 'auto' }, siteOf(link));
+    const title = h('div', { class: 'link-title', dir: 'auto' }, siteOf(e.url));
     const meta = h('div', { class: 'link-meta' }, 'Starting…');
     const fill = h('i');
     const media = h('div', { class: 'dl-media', hidden: true });
-    const alt = h('button', { class: 'dl-alt', type: 'button', onclick: () => giveUp('') }, 'Save for computer instead');
-    const el = h('div', { class: 'dl indet' }, head, h('div', { class: 'dl-card' }, title, meta, h('div', { class: 'up-bar' }, fill), media, alt));
-    phoneList.append(el);
-    let timer = 0, misses = 0, over = false;
-    const card = { stop: () => clearTimeout(timer) };
-
-    const show = (text, p = null, state = '') => {
-      meta.textContent = text;
-      el.classList.toggle('indet', p == null && !state);
-      fill.style.width = p == null ? '' : `${Math.round(Math.min(1, p) * 100)}%`;
-      if (state) el.dataset.state = state;
-    };
-    const forget = () => { if (id) { forgetJob(id); finishJob(id).catch(() => {}); cards.delete(id); } };
-    function giveUp(reason, detail = '') {
-      over = true;
-      clearTimeout(timer);
-      forget();
-      el.remove();
-      if (reason === 'off' || reason === 'auth') { bridgeUp = false; linkMode(); }
-      const why = reason === 'off' ? 'Phone downloader is off.'
-        : reason === 'auth' ? 'Phone downloader needs setting up again.'
-        : reason === 'gone' ? 'The download on the phone was lost.'
-        : reason ? `${String(detail || 'Couldn’t download it on this phone').replace(/[.!]?\s*$/, '.')}` : '';
-      phoneFailed(link, why);
-    }
-
-    async function begin() {
-      if (!(await bridgeP)) return giveUp(pingProblem() === 'auth' ? 'auth' : 'off');
-      if (closed) return;
-      if (!id) {
-        try { ({ id } = await startDownload(link)); } catch (e) { return giveUp(e.code === 'auth' ? 'auth' : e.code === 'off' ? 'off' : 'job', e.message); }
-        rememberJob(id, link);
-        if (lsGet(SHARE_KEY)?.url === link) lsSet(SHARE_KEY, null);   // the phone has it now
-      }
-      if (cards.has(id)) { el.remove(); return; }   // the bridge already had this link going: that card shows it
-      cards.set(id, card);
-      poll();
-    }
-    async function poll() {
-      if (closed || over) return;
-      let j;
-      try {
-        j = await getJob(id);
-        misses = 0;
-      } catch (e) {
-        if (closed) return;
-        if (e.code === 'notfound') {
-          if (phoneClaims.has(id)) return claim(null);
-          // Gone from the bridge: kept by another Perch window (it forgets the job once it has the file), or lost.
-          return activeJobs().some((x) => x.id === id) ? giveUp('gone') : keptElsewhere();
-        }
-        if (e.code === 'auth') return giveUp('auth');
-        if (++misses >= 6) return giveUp('off');
-        timer = setTimeout(poll, 700);
-        return;
-      }
-      if (closed) return;
-      if (j.title) title.textContent = j.title;
-      if (j.status === 'done') return claim(j);
-      if (j.status === 'error') return failed(j);
-      show(...jobText(j));
-      timer = setTimeout(poll, 700);
-    }
-    function failed(j) {
-      // Links that can never work: just say so. Anything else may still work on the computer.
-      if (j.code !== 'unsupported' && j.code !== 'novideo') return giveUp('job', j.error);
-      over = true;
-      forget();
-      alt.hidden = true;
-      head.textContent = 'Couldn’t download';
-      show(j.error || 'There’s no video to save here.', null, 'error');
-    }
-    async function claim(j) {
-      over = true;
-      alt.hidden = true;
-      let c = phoneClaims.get(id);
-      if (!c) {
-        c = { listen: null };
-        c.p = claimOnce(id, link, j, (got, total) => c.listen && c.listen(got, total));
-        phoneClaims.set(id, c);
-        c.p.then(() => phoneClaims.delete(id), () => phoneClaims.delete(id));
-      }
-      c.listen = (got, total) => { if (!closed) show(`Almost done · ${total ? Math.floor((100 * got) / total) : 0}%`, total ? got / total : null); };
-      show('Almost done', null);
-      try {
-        const files = await c.p;
-        if (!closed) { if (files) ready(files, j); else keptElsewhere(); }
-      } catch (e) {
-        if (!closed) giveUp('job', e.message);
-      }
-    }
-    function keptElsewhere() {
-      over = true;
-      cards.delete(id);
-      alt.hidden = true;
-      head.textContent = 'Downloaded on this phone';
-      show('Saved in another Perch window', 1, 'done');
-    }
-    function ready(files, j) {
-      el.classList.remove('indet');
-      head.textContent = 'Downloaded on this phone';
-      title.textContent = j?.title || files[0].name;
-      // It's already a tile in "All" (js/pending.js), playing from this phone until Eagle has it.
-      show(`${files.length > 1 ? `${files.length} videos in` : 'In'} your library now · Eagle adds ${files.length > 1 ? 'them' : 'it'} on your computer`, 1, 'done');
-      const f = files.find((x) => /^video\//.test(x.type)) || files[0];
-      const src = URL.createObjectURL(f);
-      blobUrls.push(src);
-      media.replaceChildren(/^image\//.test(f.type) ? h('img', { src, alt: '' }) : h('video', { src, controls: true, playsinline: true, preload: 'metadata' }));
-      media.hidden = false;
-    }
-    begin();
-    return card;
+    const retry = h('button', { class: 'link-retry', type: 'button', hidden: true, onclick: () => retryJob(e) }, 'Retry');
+    const alt = h('button', { class: 'dl-alt', type: 'button', onclick: () => giveUp(e, '') }, 'Save for computer instead');
+    const root = h('div', { class: 'dl indet' }, head, h('div', { class: 'dl-card' }, title, meta, h('div', { class: 'up-bar' }, fill), media, retry, alt));
+    phoneList.append(root);
+    return { root, head, title, meta, fill, media, retry, alt };
   }
+  function paint(c, e) {
+    const finished = e.state === 'ready' || e.state === 'kept';
+    c.head.textContent = finished ? 'Downloaded on this phone' : e.state === 'error' ? 'Couldn’t download' : 'Downloading on this phone';
+    c.title.textContent = e.title || siteOf(e.url);
+    let text = e.text;
+    if (e.state === 'ready') {
+      const n = Object.keys(e.kept || {}).length || 1;
+      // It's already a tile in "All" (js/pending.js), playing from this phone until Eagle has it.
+      text = `${n > 1 ? `${n} videos in` : 'In'} your library now · Eagle adds ${n > 1 ? 'them' : 'it'} on your computer`;
+    }
+    const state = finished ? 'done' : e.state === 'error' || e.state === 'retry' ? 'error' : '';
+    c.meta.textContent = text;
+    c.root.classList.toggle('indet', e.p == null && !state);
+    c.fill.style.width = e.p == null ? '' : `${Math.round(Math.min(1, e.p) * 100)}%`;
+    if (state) c.root.dataset.state = state; else delete c.root.dataset.state;
+    c.alt.hidden = !(e.state === 'start' || e.state === 'run' || e.state === 'retry');
+    c.retry.hidden = e.state !== 'retry';
+    if (e.state === 'ready' && e.preview && !c.media.childElementCount) {
+      const src = URL.createObjectURL(e.preview);
+      blobUrls.push(src);
+      c.media.replaceChildren(/^image\//.test(e.preview.type) ? h('img', { src, alt: '' }) : h('video', { src, controls: true, playsinline: true, preload: 'metadata' }));
+      c.media.hidden = false;
+    }
+  }
+  let cardFrame = 0;
+  function renderCards() {
+    cardFrame = 0;
+    if (closed) return;
+    for (const e of W.list) {
+      let c = cards.get(e.key);
+      if (!c) { c = card(e); cards.set(e.key, c); }
+      paint(c, e);
+    }
+    const live = new Set(W.list.map((e) => e.key));
+    for (const [k, c] of cards) if (!live.has(k)) { c.root.remove(); cards.delete(k); }
+  }
+  const onWatch = (ev) => {
+    if (closed) return;
+    if (ev.type === 'pc') { onPc(ev); return; }
+    if (ev.type === 'down') { bridgeUp = false; linkMode(); }
+    if (!cardFrame) cardFrame = requestAnimationFrame(renderCards);
+  };
 
   async function loadRecent() {
     try {
@@ -1413,10 +1823,10 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     } catch { /* the list is a nicety */ }
   }
 
-  const primary = () => { if (!empty()) { if (bridgeUp) download(); else save(); } };
+  const primary = () => { if (saving || empty()) return; if (bridgeUp) download(); else save(); };
   saveBtn.addEventListener('click', primary);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter') primary(); });
-  input.addEventListener('input', () => { err.textContent = ''; linkMode(); });
+  input.addEventListener('input', () => { err.textContent = ''; reconnectBtn.hidden = true; linkMode(); });
   const paste = navigator.clipboard && navigator.clipboard.readText
     ? h('button', { class: 'btn-quiet', type: 'button', onclick: async () => { try { const t = await navigator.clipboard.readText(); const u = extractUrl(t); if (u) { input.value = u; err.textContent = ''; linkMode(); } else err.textContent = 'No link on the clipboard.'; } catch { /* refused */ } } }, 'Paste')
     : null;
@@ -1425,31 +1835,33 @@ function openSaveLink({ url = '', auto = false, pc = false } = {}) {
     h('p', { class: 'link-note' }, `Already downloaded? Eagle adds it to ${libName ? `“${libName}”` : 'the library'} as soon as it opens — your computer downloads nothing.`));
   const form = h('div', { class: 'form' },
     h('div', { class: 'group-label flush' }, 'Or a link'),
-    h('div', { class: 'field-row' }, input, paste), err,
+    h('div', { class: 'field-row' }, input, paste), err, reconnectBtn,
     linkNote,
     saveBtn, pcBtn);
   S.shareOpen = true;
+  // What finished before this sheet opened has been seen (its tile is in "All"); what's still going shows.
+  W.list = W.list.filter((e) => !ENDED.has(e.state));
   uploadListeners.add(onUploads);
+  W.listeners.add(onWatch);
   openSheet({
     title: 'Save to Eagle',
     sub: writable ? (libName ? `Into “${libName}”` : '') : 'Google will ask once to let Perch save to your Drive. Perch can only see the files it saves.',
     body: [phoneList, uploads, phone, done, form, recent],
     onClose: () => {
       S.shareOpen = false;
-      closed = true;   // downloads carry on in the phone downloader; the next sheet picks them up
-      for (const c of cards.values()) c.stop();
+      closed = true;   // downloads carry on without the sheet (the watcher); only one not started yet is dropped
+      for (const e of W.list) if (e.state === 'start' && !e.id && e.cancellable) e.cancelled = true;
       for (const u of blobUrls) URL.revokeObjectURL(u);
       uploadListeners.delete(onUploads);
+      W.listeners.delete(onWatch);
       cancelAnimationFrame(frame);
+      cancelAnimationFrame(cardFrame);
       up().clearSaved();
+      if (S.renewWhenIdle && !videoPlaying()) { S.renewWhenIdle = false; renewSoon('idle'); }
     },
   });
   up().refresh();
-  if (paired()) for (const j of activeJobs()) phoneCard(j);   // downloads still going from before
-  if (auto && url) {
-    if (paired() && !pc) { input.value = ''; linkMode(); phoneCard({ url }); }
-    else if (writable) save(url);
-  }
+  renderCards();
   if (S.drive) loadRecent();
 }
 
@@ -1460,37 +1872,6 @@ function jobText(j) {
   const p = j.progress != null ? j.progress : j.total ? j.downloaded / j.total : null;
   const size = j.total ? `${fmtBytes(j.downloaded)} of ${fmtBytes(j.total)}` : fmtBytes(j.downloaded);
   return [[p != null ? `${Math.floor(p * 100)}%` : '', size].filter(Boolean).join(' · ') || 'Downloading…', p];
-}
-
-/**
- * The installed app and a browser tab may both be watching the same job: only one copies it in. The other
- * waits its turn and then finds the job already kept (null).
- */
-function claimOnce(id, url, job, onProgress) {
-  const mine = () => (activeJobs().some((x) => x.id === id) ? copyIn(id, url, job, onProgress) : null);
-  return navigator.locks ? navigator.locks.request(`perch-bridge-${id}`, mine) : mine();
-}
-
-/**
- * Copy a finished download from the phone downloader into Perch and queue it for Drive (the source link goes
- * with it, so Eagle records the website). Runs to the end even if the sheet closes meanwhile.
- */
-async function copyIn(id, url, job, onProgress) {
-  const list = (job && job.files) || [];
-  const total = list.reduce((a, f) => a + (Number(f.size) || 0), 0);
-  const files = [];
-  let before = 0;
-  for (const f of list) {
-    const file = await fetchFile(id, f.n, (got) => onProgress(before + got, total), f);
-    files.push(file);
-    before += file.size;
-  }
-  if (!files.length) throw new BridgeError('novideo', 'There’s no video to save here.');
-  await stash(files, { url });
-  forgetJob(id);
-  finishJob(id).catch(() => {});   // safely on this phone: the downloader can drop its copy
-  if (canSend()) up().run(); else askWrite();
-  return files;
 }
 
 // ── phone downloader ─────────────────────────────────────────────────────────
@@ -1595,16 +1976,21 @@ function openBridgeSetup() {
   });
 }
 
-function confirmSignOut() {
+async function confirmSignOut() {
+  // Videos sent from this phone that haven't reached Drive would be lost: say so before anything goes.
+  const n = (await waiting().catch(() => [])).length;
   openSheet({
     title: 'Sign out?',
-    sub: 'Perch forgets your library on this device. Nothing changes in Drive or Eagle.',
+    sub: n
+      ? `${n} ${n === 1 ? 'video hasn’t' : 'videos haven’t'} uploaded to Drive yet. Signing out removes ${n === 1 ? 'it' : 'them'} from this phone. Your library is forgotten on this device; nothing changes in Drive or Eagle.`
+      : 'Perch forgets your library on this device. Nothing changes in Drive or Eagle.',
     body: h('div', { class: 'form' }, h('button', { class: 'btn-primary', type: 'button', style: { background: '#ff453a', color: '#fff' }, onclick: doSignOut }, 'Sign out')),
   });
 }
 
 async function doSignOut() {
   signOut();
+  await clearWaiting();   // the user was told (and agreed) above
   lsSet('perch.mode', null);
   lsSet('perch.lib.drive', null);
   lsSet('perch.pasted.drive', null);
@@ -1618,6 +2004,7 @@ async function doSignOut() {
 async function exitDemo() {
   lsSet('perch.mode', null);
   for (const k of ['perch.pending.', 'perch.inbox.', 'perch.inbox.cache.']) lsSet(k + S.modeKey, null);
+  try { for (const k of Object.keys(localStorage)) if (k.startsWith(`perch.deleted.${S.modeKey}.`)) localStorage.removeItem(k); } catch { /* ignore */ }
   try { await caches.delete(MOCK_CACHE); } catch { /* ignore */ }   // the demo inbox starts empty next time
   location.replace(location.pathname);
 }
@@ -1715,19 +2102,45 @@ addEventListener('keydown', (e) => {
 
 // ── misc ─────────────────────────────────────────────────────────────────────
 let toastTimer = 0;
-function toast(a, b) {
-  el.toast.replaceChildren(...(b === undefined ? [a] : [a, b]).map((x) => (x instanceof Node ? x : document.createTextNode(String(x)))));
+/** A short message. `action` adds a button (e.g. Undo) that runs `onAction`; `ms` keeps it up longer. */
+function toast(a, b, { action = '', onAction = null, ms = 1700 } = {}) {
+  const parts = (b === undefined ? [a] : [a, b]).map((x) => (x instanceof Node ? x : document.createTextNode(String(x))));
+  if (action && onAction) {
+    parts.push(h('button', { class: 'toast-act', type: 'button', onclick: (e) => {
+      e.stopPropagation();
+      clearTimeout(toastTimer);
+      el.toast.classList.remove('on');
+      onAction();
+    } }, action));
+  }
+  el.toast.replaceChildren(...parts);
   el.toast.classList.toggle('top', viewer.isOpen || isSheetOpen()); // stay clear of the sheet
   el.toast.classList.add('on');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.toast.classList.remove('on'), 1700);
+  toastTimer = setTimeout(() => el.toast.classList.remove('on'), ms);
 }
 
-addEventListener('pageshow', (e) => { if (e.persisted) onResume(); });
-addEventListener('online', () => { if (S.screen === 'main' && canSend()) up().retry(); });
+addEventListener('pageshow', (e) => {
+  if (!e.persisted) return;
+  // Back from Google's page through the back/forward cache: the redirect we started never happened.
+  if (S.redirecting) {
+    S.redirecting = false;
+    if (/Refreshing/.test(el.notice.textContent || '')) setNotice(null);
+  }
+  onResume();
+});
+addEventListener('online', () => {
+  // Signed out by an expired token while offline: renew quietly now; a renew that works syncs (renewQuiet).
+  if (S.mode === 'drive' && S.screen === 'main' && !S.redirecting && !tokenValid()) {
+    renewQuiet('online').then((ok) => { if (!ok && !tokenValid() && S.authLost) onAuthLost(); });
+  }
+  if (S.screen === 'main' && canSend()) up().retrySoft({ now: true });
+  flushDeletes();
+});
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) onResume();
-  if (!document.hidden && S.screen === 'main' && !S.redirecting && canSend()) up().run();   // uploads left from last time
+  if (!document.hidden && S.screen === 'main' && !S.redirecting && canSend()) up().retrySoft();   // uploads left from last time
+  if (!document.hidden && S.screen === 'main' && !S.redirecting) resumeWatcher();                 // downloads on the phone
   if (!document.hidden && S.screen === 'main' && !S.redirecting) refreshPending();
   if (document.hidden || S.redirecting || S.screen !== 'main' || !S.snap) return;
   if (Date.now() - S.snap.lastSync > 5 * 60_000 && (S.mode === 'demo' || tokenValid())) runSync({ background: true });

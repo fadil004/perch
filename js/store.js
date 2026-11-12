@@ -54,6 +54,7 @@ export const thumbStore = {
     return run('thumbs', 'readwrite', (s) => s.put({ buf, type: blob.type }, id));
   },
   has: (id) => run('thumbs', 'readonly', (s) => s.getKey(id)).then((k) => k !== undefined),
+  del: (id) => run('thumbs', 'readwrite', (s) => s.delete(id)),
 };
 
 export async function wipeAll() {
@@ -65,7 +66,7 @@ export async function wipeAll() {
   });
   try { await caches.delete('perch-kv'); } catch { /* ignore */ }
   try { await caches.delete('perch-media'); } catch { /* ignore */ }   // videos kept by the service worker
-  try { await caches.delete('perch-share'); } catch { /* ignore */ }   // shared videos not uploaded yet
+  // Never 'perch-share': videos sent from this phone that haven't reached Drive yet (sign-out asks first).
 }
 
 // Small JSON values shared with the service worker (it can't see localStorage).

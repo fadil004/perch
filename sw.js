@@ -10,7 +10,7 @@
 // 4. Share target: a video shared from another app (POST ./share-target) is kept in the 'perch-share' cache
 //    and the app opens to upload it to Drive; a shared link goes on to the app as ?share_url=….
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v12';
+const VERSION = 'perch-v13';
 const MEDIA_CACHE = 'perch-media';
 const MEDIA_MAX_FILE = 30 * 1024 * 1024;
 const MEDIA_BUDGET = 600 * 1024 * 1024;
@@ -63,6 +63,7 @@ self.addEventListener('fetch', (event) => {
 /** Something was shared to Perch from another app. Files wait in the share cache; links go on as before. */
 async function receiveShare(req) {
   const back = new URL('./', SCOPE);
+  let stored = 0;
   try {
     const form = await req.formData();
     const text = ['share_url', 'share_text', 'share_title'].map((k) => [k, String(form.get(k) || '')]).filter(([, v]) => v);
@@ -80,14 +81,16 @@ async function receiveShare(req) {
           'x-size': String(f.size),
           'x-url': encodeURIComponent(link),
         } }));
+        stored++;
       }
-      back.searchParams.set('shared', String(files.length));
+      back.searchParams.set('shared', String(stored));
     } else {
       for (const [k, v] of text) back.searchParams.set(k, v);
       if (!text.length) back.searchParams.set('shared', 'empty');
     }
   } catch (e) {
-    back.searchParams.set('shared', 'failed');
+    // Some files may be in already (a later one didn't fit): say how many, so those still upload.
+    back.searchParams.set('shared', stored ? String(stored) : 'failed');
   }
   return Response.redirect(back.href, 303);
 }
@@ -196,10 +199,15 @@ async function media(event, req, id) {
     // Prefetch from the viewer: fill the cache in the background and answer at once.
     if (req.headers.get('x-perch-prefetch')) {
       const size = Number(req.headers.get('x-perch-size')) || 0;
-      if (size <= MEDIA_MAX_FILE && !(await cachedMedia(key))) event.waitUntil(wholeFile(mode, id, key));
+      // Answer once the whole file is in, so the viewer's one-at-a-time prefetch really limits downloads.
+      if (size <= MEDIA_MAX_FILE && !(await cachedMedia(key, event))) {
+        const p = wholeFile(mode, id, key);
+        event.waitUntil(p);
+        await p.catch(() => {});
+      }
       return new Response(null, { status: 204 });
     }
-    const hit = await cachedMedia(key);
+    const hit = await cachedMedia(key, event);
     if (hit) return sliceResponse(hit, range);
 
     const res = await upstream(mode, id, range);
@@ -251,11 +259,11 @@ function wholeFile(mode, id, key) {
   })());
 }
 
-async function cachedMedia(key) {
+async function cachedMedia(key, event) {
   try {
     const c = await caches.open(MEDIA_CACHE);
     const hit = await c.match(key);
-    if (hit) touch(key);
+    if (hit) event.waitUntil(touch(key));   // the index write stays inside the event's lifetime
     return hit || null;
   } catch { return null; }
 }
@@ -280,7 +288,8 @@ async function sliceResponse(hit, range) {
 
 // LRU index of the media cache: key → { size, used }. Kept in the kv cache.
 let indexP = null;
-let indexSave = 0;
+let indexSave = null;   // { timer, p, resolve } of the debounced index write
+let evicting = Promise.resolve();   // evictions run one after another, each from the current index
 function mediaIndex() {
   if (!indexP) indexP = (async () => {
     let idx = {};
@@ -297,33 +306,46 @@ function mediaIndex() {
   })();
   return indexP;
 }
+async function writeIndex() {
+  try {
+    const idx = await mediaIndex();
+    const c = await caches.open('perch-kv');
+    await c.put(new URL('__kv/media-index', SCOPE).href, new Response(JSON.stringify(idx), { headers: { 'content-type': 'application/json' } }));
+  } catch { /* ignore */ }
+}
+/** Write the index soon (a burst of touches writes once). Resolves when written, so callers can waitUntil it. */
 function saveIndex() {
-  clearTimeout(indexSave);
-  indexSave = setTimeout(async () => {
-    try {
-      const idx = await mediaIndex();
-      const c = await caches.open('perch-kv');
-      await c.put(new URL('__kv/media-index', SCOPE).href, new Response(JSON.stringify(idx), { headers: { 'content-type': 'application/json' } }));
-    } catch { /* ignore */ }
-  }, 800);
+  if (!indexSave) {
+    let resolve;
+    const p = new Promise((r) => { resolve = r; });
+    indexSave = { p, resolve, timer: 0 };
+  }
+  const s = indexSave;
+  clearTimeout(s.timer);
+  s.timer = setTimeout(() => { if (indexSave === s) indexSave = null; writeIndex().then(s.resolve); }, 800);
+  return s.p;
 }
 async function touch(key) {
   const idx = await mediaIndex();
-  if (idx[key]) { idx[key].used = Date.now(); saveIndex(); }
+  if (idx[key]) { idx[key].used = Date.now(); return saveIndex(); }
 }
 
 async function putMedia(key, res, total) {
   const c = await caches.open(MEDIA_CACHE);
   await c.put(key, res);                       // settles once the whole body has arrived
-  const idx = await mediaIndex();
-  idx[key] = { size: total, used: Date.now() };
-  let sum = Object.values(idx).reduce((a, e) => a + (e.size || 0), 0);
-  for (const [k] of Object.entries(idx).sort((a, b) => a[1].used - b[1].used)) {
-    if (sum <= MEDIA_BUDGET) break;
-    if (k === key) continue;
-    sum -= idx[k].size || 0;
-    delete idx[k];
-    await c.delete(k);
-  }
-  saveIndex();
+  const run = evicting.then(async () => {
+    const idx = await mediaIndex();
+    idx[key] = { size: total, used: Date.now() };
+    let sum = Object.values(idx).reduce((a, e) => a + (e?.size || 0), 0);
+    for (const [k] of Object.entries(idx).sort((a, b) => a[1].used - b[1].used)) {
+      if (sum <= MEDIA_BUDGET) break;
+      if (k === key || !idx[k]) continue;
+      sum -= idx[k]?.size || 0;
+      delete idx[k];
+      await c.delete(k);
+    }
+    await writeIndex();
+  });
+  evicting = run.catch(() => {});
+  return run;
 }

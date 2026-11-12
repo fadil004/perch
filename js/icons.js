@@ -39,6 +39,7 @@ export const I = {
   // Phone downloader: a phone with an arrow down; a document for the cookies file.
   phone: s('<rect x="6.75" y="3.25" width="10.5" height="17.5" rx="2.4"/><path d="M12 7.5v6.25"/><path d="m9.6 11.5 2.4 2.4 2.4-2.4"/>'),
   download: s('<path d="M12 4.25v10.5"/><path d="m7.75 10.75 4.25 4.25 4.25-4.25"/><path d="M4.75 15.75v2.5a1.5 1.5 0 0 0 1.5 1.5h11.5a1.5 1.5 0 0 0 1.5-1.5v-2.5"/>'),
+  trash: s('<path d="M4.75 7h14.5"/><path d="M9.25 7V5.5a1.25 1.25 0 0 1 1.25-1.25h3a1.25 1.25 0 0 1 1.25 1.25V7"/><path d="m6.5 7 .8 11.1a1.75 1.75 0 0 0 1.75 1.65h5.9a1.75 1.75 0 0 0 1.75-1.65L17.5 7"/><path d="M10.25 10.75v5.5M13.75 10.75v5.5"/>'),
   doc: s('<path d="M7.25 3.75h6.5l4 4v11a1.5 1.5 0 0 1-1.5 1.5h-9a1.5 1.5 0 0 1-1.5-1.5V5.25a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M13.5 3.75v4.25h4.25M9 12.5h6M9 16h4"/>'),
   // Brand-neutral mark: a dot resting on a perch.
   mark: `<svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="29.5" cy="21.5" r="5.5" fill="currentColor" stroke="none"/><path d="M9 31h30" stroke-width="2.6"/></svg>`,

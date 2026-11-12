@@ -7,7 +7,7 @@ import { lsGet, lsSet } from './util.js';
 
 export const BRIDGE = 'http://127.0.0.1:47821';
 const KEY = 'perch.bridge';             // { token } — handed over once by the installer (#bridge=<token>)
-const JOBS_KEY = 'perch.bridge.jobs';   // downloads still running in the bridge: [{ id, url, t }]
+const JOBS_KEY = 'perch.bridge.jobs';   // downloads still running in the bridge: [{ id, url, t, lib }]
 const DEV_KEY = 'perch.bridge.dev';     // another bridge address, honoured on dev hosts only (tests)
 const JOB_TTL = 24 * 60 * 60_000;       // the bridge drops unclaimed jobs after a day
 const DEV = /(^|\.)localhost$|^127\.0\.0\.1$|^\[::1\]$/.test(location.hostname);
@@ -98,42 +98,35 @@ function nameFrom(cd) {
 }
 
 /**
- * Copy a finished file from the bridge into the page, with progress (got, total). A connection cut part-way
- * carries on from the last byte (Range) a couple of times before giving up. `meta` ({ name, size, type })
- * from the job fills in what the headers don't say.
+ * Copy a finished file from the bridge straight into the phone's storage, with progress (got, total). The bytes
+ * stream through `keep(body, { name, type, size })` (which stores them and resolves with what it kept) and are
+ * never held in memory, so a large video can't take the page down. A connection cut part-way starts the copy
+ * again (it's loopback, so that's quick), twice at most. `meta` ({ name, size, type }) from the job fills in
+ * what the headers don't say. Resolves with keep's result plus { name, type, size }.
  */
-export async function fetchFile(id, n, onProgress = () => {}, meta = {}) {
-  const chunks = [];
-  let got = 0, total = Number(meta.size) || 0, type = meta.type || '', name = meta.name || '';
+export async function fetchFile(id, n, onProgress = () => {}, meta = {}, keep) {
   for (let attempt = 0; ; attempt++) {
+    let got = 0;
     try {
-      const res = await call('GET', `/file/${encodeURIComponent(id)}/${n}`, { timeout: 0, headers: got ? { Range: `bytes=${got}-` } : {} });
-      if (got && res.status !== 206) { chunks.length = 0; got = 0; }   // the bridge sent it all again
-      if (!got) {
-        total = total || Number(res.headers.get('content-length')) || 0;
-        type = type || (res.headers.get('content-type') || '').split(';')[0];
-        name = name || nameFrom(res.headers.get('content-disposition'));
-      }
-      if (!res.body) { const b = await res.blob(); chunks.push(b); got += b.size; }
-      else {
-        const reader = res.body.getReader();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          got += value.length;
-          onProgress(got, total);
-        }
-      }
-      if (total && got < total) throw new BridgeError('off', 'The file was cut off');
-      break;
+      const res = await call('GET', `/file/${encodeURIComponent(id)}/${n}`, { timeout: 0 });
+      const total = Number(meta.size) || Number(res.headers.get('content-length')) || 0;
+      const type = meta.type || (res.headers.get('content-type') || '').split(';')[0] || 'video/mp4';
+      const name = meta.name || nameFrom(res.headers.get('content-disposition')) || `video-${n}.mp4`;
+      const body = res.body || (await res.blob()).stream();
+      const count = new TransformStream({
+        transform(chunk, ctl) { got += chunk.byteLength; onProgress(got, total); ctl.enqueue(chunk); },
+        // Short: fail the stream, so nothing half-copied is kept.
+        flush() { if (total && got < total) throw new BridgeError('off', 'The file was cut off'); },
+      });
+      const kept = await keep(body.pipeThrough(count), { name, type, size: total });
+      onProgress(total || got, total || got);
+      return { ...kept, name, type, size: total || got };
     } catch (e) {
-      const cut = e.code === 'off' || e.name === 'TypeError';   // TypeError: the stream broke off mid-way
-      if (!cut || attempt >= 2) throw cut ? new BridgeError('off', 'Couldn’t copy the video from the phone downloader') : e;
+      if (e && e.name === 'QuotaExceededError') throw e;                          // the phone is full: retrying won't help
+      if (e && e.name === 'BridgeError' && e.code !== 'off') throw e;            // auth, notfound…
+      if (attempt >= 2) throw new BridgeError('copy', 'Couldn’t copy the video from the phone downloader');
     }
   }
-  onProgress(got, total || got);
-  return new File(chunks, name || `video-${n}.mp4`, { type: type || 'video/mp4' });
 }
 
 // ── downloads still running in the bridge (so a reopened sheet, or the next launch, picks them up) ──
@@ -141,8 +134,8 @@ export function activeJobs() {
   const now = Date.now();
   return lsGet(JOBS_KEY, []).filter((j) => j && j.id && now - j.t < JOB_TTL);
 }
-export function rememberJob(id, url) {
-  lsSet(JOBS_KEY, [...activeJobs().filter((j) => j.id !== id), { id, url, t: Date.now() }]);
+export function rememberJob(id, url, lib = '') {
+  lsSet(JOBS_KEY, [...activeJobs().filter((j) => j.id !== id), { id, url, t: Date.now(), lib }]);
 }
 export function forgetJob(id) {
   const rest = activeJobs().filter((j) => j.id !== id);

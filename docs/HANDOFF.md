@@ -80,6 +80,43 @@ turning `done` removes the tile and triggers a sync; never shown twice (`notInLi
 is a tiny dot; the viewer's info panel says where it is. Download/Save buttons stay disabled while the
 link field is empty.
 
+## v13 — delete from the phone
+
+Trash button in the viewer (needs Drive write access, else `askWrite`). The item leaves at once; a toast offers
+Undo for 5 s; then `Perch Inbox/<stem>.json` `{ v: 1, kind: "delete", item, name, library, sentAt, from, status }`
+is written and plugin 1.5.0 moves the item to Eagle's Trash (`moveToTrash` only). Perch keeps it hidden
+(`perch.deleted.<modeKey>.<libId>`, filtered before the `Library` model is built) until a sync no longer has it;
+a failed write retries with `refreshPending`/`online`; plugin `status: 'error'` shows it again; 30 days unprocessed
+→ shown again. A pending phone video is never sent: its upload stops (`uploader.cancel`) or its inbox files go to
+Drive's bin (`drive.trash`). Delete requests come back from the same inbox listing (`inboxRequests`).
+Plugin: a delete without `library` is rejected; at most 25 per scan; not found → retried for 3 days.
+
+### v13 — review fixes (three read-only reviews, then two fix batches)
+
+Reliability (main.js, uploads.js, inbox.js, drive.js, auth.js, store.js, eagle.js, bridge.js, sw.js):
+- `perch.share` is a queue (`[{ url, t, pc, job }]`, kept 24 h). Phone downloads are followed by a module-level
+  watcher (`W`, `watchLink`/`watchJob`/`pollJob`/`claimJob`) whether the Save sheet is open or not; the sheet only
+  draws the watcher's entries. A failed copy-in keeps the bridge job (Retry). Bridge files stream straight into
+  the share cache (`stashStream`), never through memory.
+- `wipeAll()` no longer deletes `perch-share`; sign-out confirms when videos are waiting.
+- Uploads: failure kind + backoff, soft retry on resume/online/renew; request JSON checked before create and
+  deduped by stem; library fixed per stem at share time (`perch.up.lib`); 45 s stall watchdog on PUT and API calls.
+- Auth: `WRITE_KEY` follows the scope Google returned; a frame timeout is not a frame failure; offline with an
+  expired token shows "Offline · saved library" and renews on `online`.
+- Sync: a missing `.info`/`metadata.json` is retried after 10 min instead of skipped for good; a sync finishing
+  while the viewer is open is applied on close (`S.snapLater`); snapshot written to IndexedDB only when changed.
+- `navigator.storage.persist()` at boot.
+
+Viewer / touch (viewer.js, grid.js, css): track springs home after an interrupted swipe; close maps to the tile
+by id and the grid keeps its place by item id; cancelled dismiss doesn't start a paused video; "This format can't
+play on the phone" for decode errors; unknown-size videos use `it.ratio` and `object-fit: contain`; pointercancel
+is not a tap; video pauses when hidden; next video starts within 2 px of the swipe target; one seek in flight
+while scrubbing; prefetch one at a time after `canplaythrough` (the service worker answers a prefetch only when
+the file is cached).
+
+Tests live outside the repo (session scratch): `run.sh` runs batch A (19), v13 delete (20), v11, v10, v9;
+`runb.sh` runs 39 touch checks. None of this has run on the real phone yet.
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

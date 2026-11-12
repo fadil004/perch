@@ -201,6 +201,7 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
   };
 
   let created = 0;
+  const trashedIds = [];        // files moved to the bin (drive.trash), for tests
   const sessions = new Map();   // resumable uploads in progress: session URL -> { meta, size, got, parts }
   const bytes = new Map();      // uploaded file id -> () => Promise<Blob>
 
@@ -262,6 +263,12 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
       const id = decodeURIComponent(m[1]);
       const f = files.get(id);
       if (!f) return fail(404, `File not found: ${id}`);
+      if (method === 'PATCH' && meta && meta.trashed) {
+        // files.update { trashed: true }: gone from every listing (and from the kept demo inbox).
+        trashedIds.push(id);
+        remove(id); bytes.delete(id); patches.delete(id); await forget(id);
+        return json({ id });
+      }
       if (params.alt === 'media') {
         if (patches.has(id)) return json(await patches.get(id)());
         if (bytes.has(id)) { const b = await bytes.get(id)(); return new Response(b, { headers: { 'content-type': b.type || 'application/octet-stream', 'content-length': String(b.size) } }); }
@@ -321,5 +328,5 @@ export async function createMockDrive(manifestUrl, { latency = 140, scale = 0, m
     return out;
   }
 
-  return { backend, mediaMap, fileCount: () => files.size, hasBytes: (id) => bytes.has(id), writeBack, removeFile };
+  return { backend, mediaMap, fileCount: () => files.size, hasBytes: (id) => bytes.has(id), writeBack, removeFile, trashed: () => [...trashedIds] };
 }

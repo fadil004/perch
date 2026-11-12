@@ -4,7 +4,7 @@
 // requests in the Drive inbox that aren't done, played from the video next to them in Drive.
 import { lsGet, lsSet } from './util.js';
 import { thumbStore } from './store.js';
-import { fileRequests } from './inbox.js';
+import { inboxRequests } from './inbox.js';
 import { waiting } from './uploads.js';
 
 const META_KEY = 'perch.pendmeta';                       // stem -> { w, h, d, thumb } of a video sent from here
@@ -17,7 +17,7 @@ const extOf = (name, type) => (/\.([a-z0-9]{1,8})$/i.exec(name || '') || [])[1]?
 const stemTime = (stem) => Number(String(stem).slice(0, 13)) || 0;
 
 /** An Eagle-like item for the grid and the viewer (see normalizeItem in eagle.js). */
-function toItem({ stem, name, type, size, url, sentAt, main, meta = {}, note, upload = null }) {
+function toItem({ stem, name, type, size, url, sentAt, main, meta = {}, note, upload = null, req = '' }) {
   const ext = extOf(name, type);
   const kind = ext === 'gif' ? 'gif' : /^image\//.test(type || '') || IMAGE.has(ext) ? 'image' : 'video';
   const t = Date.parse(sentAt || '') || stemTime(stem);
@@ -34,7 +34,7 @@ function toItem({ stem, name, type, size, url, sentAt, main, meta = {}, note, up
     duration: meta.d || 0, medium: '', videoID: '', pal: [],
     f: { info: null, thumb: meta.thumb ? thumbKey(stem) : null, main, thumbV: '', mainV: '' },
     _hay: '',
-    pending: { stem, note, upload },
+    pending: { stem, note, upload, req },   // req: the request's Drive file id (in the inbox already)
   };
 }
 
@@ -71,10 +71,13 @@ async function frameOf(blob, type) {
     URL.revokeObjectURL(url);
   }
 }
-/** Thumbnail + size + length for a file sent from this phone (once per file, one at a time). */
+/** Thumbnail + size + length for a file sent from this phone (once per file, one at a time). Resolves true when it kept one. */
+const capturing = new Set();
 function capture(stem, file) {
+  if (capturing.has(stem)) return Promise.resolve(false);
+  capturing.add(stem);
   chain = chain.then(async () => {
-    if (lsGet(META_KEY, {})[stem]) return;
+    if (lsGet(META_KEY, {})[stem]) return false;
     let m = { w: 0, h: 0, d: 0, thumb: 0 };   // a file the browser can't decode keeps the plain tile (no retry)
     try {
       const f = await frameOf(await file.blob(), file.type);
@@ -84,7 +87,8 @@ function capture(stem, file) {
     const all = lsGet(META_KEY, {});
     all[stem] = m;
     lsSet(META_KEY, all);
-  }).catch(() => {});
+    return true;
+  }).catch(() => false).finally(() => capturing.delete(stem));
   return chain;
 }
 
@@ -111,13 +115,15 @@ const sameLibrary = (req, libName) => {
 /**
  * The items to show, newest first. `uploads` is the upload queue's list (status/sent per stem);
  * `network: false` answers from what's on the phone plus the last Drive answer (instant, offline).
- * Resolves with { items, done } — done: stems Eagle has added (to notice one turning done).
+ * Resolves with { items, done, deletes, net } — done: stems Eagle has added (to notice one turning done);
+ * deletes: the inbox's delete requests (null without a Drive answer); net: Drive answered.
  */
 export async function collectPending({ drive, modeKey, libName, uploads = [], network = true, token = '' }) {
   const meta = () => lsGet(META_KEY, {});
   // 1. still on this phone (stashed, uploading)
   const local = await waiting();
-  for (const w of local) if (!meta()[w.id]) await capture(w.id, w);
+  // Frames are taken in the background (seconds each); the tiles show at once and fill in when they land.
+  const captures = local.filter((w) => !meta()[w.id]).map((w) => capture(w.id, w));
   const state = new Map(uploads.map((u) => [u.id, u]));
   const items = local.map((w) => {
     const u = state.get(w.id);
@@ -126,8 +132,8 @@ export async function collectPending({ drive, modeKey, libName, uploads = [], ne
     return toItem({ stem: w.id, name: w.name, type: w.type, size: w.size, url: w.url, main: `local:${w.id}`, meta: meta()[w.id], note, upload });
   });
   // 2. in the Drive inbox, not added to Eagle yet
-  let reqs = null;
-  if (network && drive) { try { reqs = await fileRequests(drive, modeKey); } catch { /* offline: the last answer */ } }
+  let reqs = null, deletes = null;
+  if (network && drive) { try { ({ files: reqs, deletes } = await inboxRequests(drive, modeKey)); } catch { /* offline: the last answer */ } }
   if (reqs) lsSet(LIST_KEY(modeKey), reqs.filter((r) => r.status !== 'done' && r.status !== 'error').slice(0, 60));
   const list = reqs || lsGet(LIST_KEY(modeKey), []) || [];
   const onPhone = new Set(local.map((w) => w.id));
@@ -141,7 +147,7 @@ export async function collectPending({ drive, modeKey, libName, uploads = [], ne
       m = { w: Number(vm.width) || 0, h: Number(vm.height) || 0, d: (Number(vm.durationMillis) || 0) / 1000, thumb: 0 };
     }
     if (!m.thumb && v.thumbnailLink && network) fetchThumbs.push([r.stem, v.thumbnailLink]);
-    const it = toItem({ stem: r.stem, name: r.name || r.file, type: r.mimeType, size: r.size || v.size, url: r.url, sentAt: r.sentAt, main: v.id, meta: m, note: NOTE_DRIVE });
+    const it = toItem({ stem: r.stem, name: r.name || r.file, type: r.mimeType, size: r.size || v.size, url: r.url, sentAt: r.sentAt, main: v.id, meta: m, note: NOTE_DRIVE, req: r.id || '' });
     // Until a copy is kept, the tile can still show Drive's thumbnail straight from its link (no CORS needed).
     if (!m.thumb && v.thumbnailLink) it.thumbUrl = v.thumbnailLink.replace(/=s\d+$/, '=s640');
     items.push(it);
@@ -151,13 +157,18 @@ export async function collectPending({ drive, modeKey, libName, uploads = [], ne
     const live = new Set([...onPhone, ...reqs.filter((r) => r.status !== 'done' && r.status !== 'error').map((r) => r.stem)]);
     const all = meta();
     const stale = Object.keys(all).filter((k) => !live.has(k) && Date.now() - stemTime(k) > 10 * 60_000);
-    if (stale.length) { for (const k of stale) delete all[k]; lsSet(META_KEY, all); }
+    if (stale.length) {
+      for (const k of stale) { delete all[k]; thumbStore.del(thumbKey(k)).catch(() => {}); }
+      lsSet(META_KEY, all);
+    }
   }
   items.sort((a, b) => b.pending.stem.localeCompare(a.pending.stem));
-  const thumbs = fetchThumbs.length
-    ? Promise.all(fetchThumbs.slice(0, 12).map(([stem, link]) => driveThumb(stem, link, token).catch(() => false))).then((r) => r.some(Boolean))
-    : Promise.resolve(false);
-  return { items, done: reqs ? reqs.filter((r) => r.status === 'done').map((r) => r.stem) : [], thumbs };
+  // `thumbs` resolves true once a new thumbnail (Drive's, or a frame from the phone's copy) is in: refresh then.
+  const thumbs = Promise.all([
+    ...fetchThumbs.slice(0, 12).map(([stem, link]) => driveThumb(stem, link, token).catch(() => false)),
+    ...captures,
+  ]).then((r) => r.some(Boolean));
+  return { items, done: reqs ? reqs.filter((r) => r.status === 'done').map((r) => r.stem) : [], thumbs, deletes, net: !!reqs };
 }
 
 /**

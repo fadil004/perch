@@ -26,7 +26,12 @@ export const RENEW_AHEAD = 10 * 60_000;   // renew when less than this is left
 export const SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 /** Only files this app creates (the link inbox). Asked for the first time a link is saved, never before. */
 export const WRITE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
-const scopes = () => (lsGet(WRITE_KEY) ? `${SCOPE} ${WRITE_SCOPE}` : SCOPE);
+const scopes = (write = false) => (write || lsGet(WRITE_KEY) ? `${SCOPE} ${WRITE_SCOPE}` : SCOPE);
+/** Remember "may write" only once Google has actually granted drive.file (never just because it was asked). */
+function noteWriteScope(scope) {
+  if (!scope) return;
+  lsSet(WRITE_KEY, scope.split(/\s+/).includes(WRITE_SCOPE) ? true : null);
+}
 /** The current token may create files (the inbox). */
 export const canWrite = (a = getAuth()) => !!(a && a.scope && a.scope.split(/\s+/).includes(WRITE_SCOPE));
 /** Silent-renew errors that genuinely need the user: only these show the Reconnect pill. */
@@ -59,12 +64,12 @@ function randomState() {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
-function authUrl({ state, silent }) {
+function authUrl({ state, silent, write = false }) {
   const p = new URLSearchParams({
     client_id: GOOGLE_CLIENT_ID.trim(),
     redirect_uri: redirectUri(),
     response_type: 'token',
-    scope: scopes(),
+    scope: scopes(write),
     include_granted_scopes: 'true',
     state,
   });
@@ -79,11 +84,11 @@ function authUrl({ state, silent }) {
  * write=true also asks to create files (drive.file), for saving links to the Eagle inbox.
  */
 export function signIn({ silent = false, write = false } = {}) {
-  if (write) lsSet(WRITE_KEY, true);
+  // WRITE_KEY is only set on the way back, once Google says drive.file was granted (see consumeRedirect).
   const state = randomState();
-  lsSet(STATE_KEY, { state, silent, t: Date.now() });
+  lsSet(STATE_KEY, { state, silent, write, t: Date.now() });
   if (silent) lsSet(SILENT_KEY, Date.now());
-  location.assign(authUrl({ state, silent }));
+  location.assign(authUrl({ state, silent, write }));
 }
 
 /** The hidden-frame renew may work here: signed in before, nothing pending from the user, not known to fail. */
@@ -114,7 +119,8 @@ export function renewInFrame({ timeout = 6000 } = {}) {
       removeEventListener('message', onMessage);
       f.remove();
       framePending = null;
-      if (!r.ok) lsSet(FRAME_KEY, { failedAt: Date.now() });
+      // Only an explicit answer from Google counts as "the frame failed"; a slow load (timeout) proves nothing.
+      if (!r.ok && r.error !== 'timeout') lsSet(FRAME_KEY, { failedAt: Date.now() });
       resolve(r);
     };
     function onMessage(e) {
@@ -131,6 +137,7 @@ export function renewInFrame({ timeout = 6000 } = {}) {
         scope: p.get('scope') || scopes(),
       };
       if (prev && prev.email) auth.email = prev.email;   // login_hint pinned the same account
+      noteWriteScope(p.get('scope'));
       lsSet(AUTH_KEY, auth);
       lsSet(NEEDS_USER_KEY, null);
       lsSet(FRAME_KEY, null);
@@ -174,6 +181,7 @@ export function consumeRedirect() {
     const f = lsGet(FRAME_KEY);
     if (f && f.failedAt && Date.now() - f.failedAt < 5 * 60_000) lsSet(FRAME_KEY, { bad: Date.now() });
   }
+  noteWriteScope(p.get('scope'));
   const auth = {
     token: p.get('access_token'),
     exp: Date.now() + (Number(p.get('expires_in')) || 3600) * 1000,

@@ -76,12 +76,18 @@ export class Grid {
   }
 
   setItems(items, { reveal = false, keepScroll = false } = {}) {
+    // Keep the user's place by the first visible item, so tiles added or removed above it don't move it.
+    const keep = keepScroll && scrollY > 0 ? this.firstVisible() : null;
     this.items = items;
     for (const el of this.live.values()) this.release(el);
     this.live.clear();
     this.ghost = -1;
     if (!keepScroll) scrollTo(0, 0);
     this.layout();
+    if (keep && !this.pending) {
+      const j = items.findIndex((it) => it.id === keep.id);
+      if (j >= 0) scrollTo(0, Math.max(0, this.top + this.y[j] - keep.offset));
+    }
     if (this.pending) { this.pendingReveal = reveal; return; }
     this.render(true);
     if (reveal) this.reveal();
@@ -119,8 +125,23 @@ export class Grid {
     this.measureTop();
   }
 
+  /** The top-most tile on screen: { id, offset from the viewport top }, or null. */
+  firstVisible() {
+    if (this.pending) return null;
+    let best = -1;
+    for (const [i] of this.live) {
+      if (this.top + this.y[i] + this.h[i] <= scrollY) continue;   // entirely above the screen
+      if (best < 0 || this.y[i] < this.y[best] || (this.y[i] === this.y[best] && this.x[i] < this.x[best])) best = i;
+    }
+    const it = best >= 0 && this.items[best];
+    return it ? { id: it.id, offset: this.top + this.y[best] - scrollY } : null;
+  }
+
   measureTop() {
-    this.top = this.el.getBoundingClientRect().top + scrollY;
+    // Layout position, not getBoundingClientRect: that includes the pull-to-refresh translateY on .content.
+    let y = 0;
+    for (let e = this.el; e; e = e.offsetParent) y += e.offsetTop;
+    this.top = y;
   }
 
   relayout() {
@@ -339,6 +360,11 @@ export class Grid {
     this.el.addEventListener('pointercancel', end);
     // iOS Safari: keep the page from zooming while pinching the grid.
     this.el.addEventListener('gesturestart', (e) => e.preventDefault());
+    // With two fingers down the browser would turn the pinch into a scroll (pan-y → pointercancel): keep it
+    // ours. One finger is left alone, so normal scrolling is untouched.
+    const twoFingers = (e) => { if (e.touches.length >= 2 && e.cancelable) e.preventDefault(); };
+    this.el.addEventListener('touchstart', twoFingers, { passive: false });
+    this.el.addEventListener('touchmove', twoFingers, { passive: false });
   }
 }
 

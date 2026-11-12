@@ -44,6 +44,10 @@ html {
   overscroll-behavior: none;
   color-scheme: dark;
 }
+/* No page pinch-zoom outside the grid and viewer (they handle pinch themselves); scrolling stays native. */
+html, .sheet-body, .suggest { touch-action: pan-x pan-y; }
+/* Long-press on the library title or the dock must not select text. */
+.hero, .topbar, .dock { -webkit-user-select: none; user-select: none; }
 
 body {
   margin: 0;
@@ -660,7 +664,7 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 }
 .v-full { opacity: 0; transition: opacity 220ms var(--ease-out); }
 .v-full.in { opacity: 1; }
-.v-zoom > video { background: transparent; }
+.v-zoom > video { background: transparent; object-fit: contain; }
 .v-embed { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
 
 .v-play {
@@ -709,8 +713,10 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   white-space: nowrap;
 }
 
+.v-msg:not(.act) { pointer-events: none; }
 .v-msg.act { pointer-events: auto; color: #fff; font: inherit; font-size: 14px; font-weight: 600; box-shadow: inset 0 0 0 .5px rgba(255,255,255,.2); transition: transform 140ms var(--ease-out); }
 .v-msg.act:active { transform: translate(-50%, -50%) scale(.96); }
+.v-msg-a { display: block; margin-top: 3px; color: #64d2ff; }
 
 .v-pulse {
   position: absolute;
@@ -775,7 +781,7 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .v-bottom:empty { display: none; }
 
 .vc { pointer-events: auto; width: 100%; max-width: 620px; display: flex; align-items: center; gap: 8px; color: #fff; }
-.vc button { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; flex: none; transition: background-color 140ms, transform 140ms var(--ease-out); }
+.vc button { width: 44px; height: 44px; margin: -4px; border-radius: 50%; display: grid; place-items: center; flex: none; transition: background-color 140ms, transform 140ms var(--ease-out); }   /* 44px target, laid out as 36px */
 .vc button:active { background: rgba(255,255,255,.12); transform: scale(.9); }
 .vc button svg { width: 20px; height: 20px; }
 .vc-t { font-size: 12px; font-weight: 500; font-variant-numeric: tabular-nums; color: rgba(255,255,255,.82); min-width: 34px; text-align: center; letter-spacing: .01em; }
@@ -874,6 +880,7 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   will-change: transform;
 }
 @media (min-width: 640px) { .v-info { left: 50%; right: auto; width: 520px; margin-left: -260px; } }
+.viewer.rot .v-info { max-height: 64%; }   /* dvh is the unturned screen; % is the turned stage */
 .v-info .sheet-grab { margin: 0 -20px; }
 .i-title { font: 600 20px/1.25 var(--font-display); letter-spacing: -.018em; margin-top: 8px; overflow-wrap: anywhere; -webkit-user-select: text; user-select: text; }
 .i-meta { margin-top: 4px; font-size: 13px; color: var(--t2); font-variant-numeric: tabular-nums; letter-spacing: .005em; }
@@ -1027,6 +1034,9 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   pointer-events: none;
 }
 .toast.on { opacity: 1; transform: translate(-50%, 0) scale(1); }
+.toast.on .toast-act { pointer-events: auto; }
+.toast-act { height: 40px; margin: -10px -10px -10px 2px; padding: 0 14px; border-radius: 999px; color: #64d2ff; font-size: 14px; font-weight: 600; }
+.toast-act:active { background: var(--fill-2); }
 .toast .sw { display: block; width: 14px; height: 14px; border-radius: 50%; box-shadow: inset 0 0 0 .5px rgba(255,255,255,.25); }
 .toast.top { bottom: auto; top: calc(var(--sat) + 58px); transform: translate(-50%, -8px) scale(.98); }
 .toast.top.on { transform: translate(-50%, 0) scale(1); }

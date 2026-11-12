@@ -103,6 +103,8 @@ export function prefetch(ids) {
   const idle = window.requestIdleCallback ? (fn) => requestIdleCallback(fn, { timeout: 1000 }) : (fn) => setTimeout(fn, 200);
   const step = () => {
     if (gen !== generation) return;
+    // In the background: wait until the app is back on screen (the next change can only be to visible).
+    if (document.hidden) { document.addEventListener('visibilitychange', step, { once: true }); return; }
     const batch = ids.slice(i, i + 24);
     i += 24;
     Promise.all(batch.map((id) => (mem.has(id) ? null : mem.size < WARM_URLS ? loadThumb(id, 'low') : warm(id)))).then(() => {
