@@ -10,7 +10,7 @@
 // 4. Share target: a video shared from another app (POST ./share-target) is kept in the 'perch-share' cache
 //    and the app opens to upload it to Drive; a shared link goes on to the app as ?share_url=….
 // Bump VERSION on every deploy.
-const VERSION = 'perch-v13';
+const VERSION = 'perch-v14';
 const MEDIA_CACHE = 'perch-media';
 const MEDIA_MAX_FILE = 30 * 1024 * 1024;
 const MEDIA_BUDGET = 600 * 1024 * 1024;
@@ -18,7 +18,7 @@ const SHARE_CACHE = 'perch-share';
 const SHELL = [
   './', './index.html', './manifest.webmanifest', './config.js', './css/app.css',
   './js/main.js', './js/util.js', './js/icons.js', './js/store.js', './js/auth.js', './js/drive.js',
-  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js', './js/framestep.js', './js/inbox.js', './js/uploads.js', './js/bridge.js', './js/pending.js',
+  './js/mockdrive.js', './js/eagle.js', './js/thumbs.js', './js/grid.js', './js/sheet.js', './js/layers.js', './js/viewer.js', './js/install.js', './js/framestep.js', './js/inbox.js', './js/uploads.js', './js/bridge.js', './js/pending.js', './js/quick.js',
   './icons/icon-192.png', './icons/icon-512.png', './icons/icon-maskable-512.png', './icons/apple-touch-icon.png',
 ];
 const DRIVE = 'https://www.googleapis.com/drive/v3/files/';

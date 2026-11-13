@@ -117,6 +117,39 @@ the file is cached).
 Tests live outside the repo (session scratch): `run.sh` runs batch A (19), v13 delete (20), v11, v10, v9;
 `runb.sh` runs 39 touch checks. None of this has run on the real phone yet.
 
+## v14 — quick share
+
+Sharing a link to Perch (Instagram, YouTube…) no longer leaves the person inside Perch. `js/quick.js` shows a one-line
+card ("Saving to Eagle…" → "Downloading on your phone ✓" / "Saved for your computer ✓"), hands the link on, and
+`main.js` (`quickShareAndClose`) calls `window.close()` ~900 ms later so Android returns to the app the link came from.
+Links only; shared files keep the old flow. The link is queued first (`queuePut`) and leaves the queue only after the
+bridge accepted it or the link is saved.
+
+- Paired + bridge version ≥ 2 (`/ping` has `upload: true`): `POST /download { url, upload: { token, expires, folder,
+  library, from: 'Perch' } }` and `rememberJob`. Token = the current one if it has ≥ 10 min left, else a hidden-frame
+  renew capped at 4 s; folder = the Perch Inbox id (`withInbox`, capped at 4 s). No usable token, no write scope or no
+  library opened yet → no quick share (today's flow), so a video never waits unseen in the downloader.
+- Not paired: `saveLink` (needs token + write scope), capped at 10 s.
+- Signed out, no write scope where Google must be asked, bridge off or v1, any error: the card goes away and today's flow
+  runs unchanged (the link is still in the queue). A v1 bridge also gets a note in the Phone downloader sheet:
+  "Update the phone downloader: open Termux and type perch-update".
+- If the page is still alive 400 ms after `window.close()` (blocked), Perch carries on quietly: a toast, no Save sheet;
+  the watcher and the tiles work as before.
+- Watcher (`pollJob`): job `upload.state` `done` → `uploadedByBridge` (forget job, `DELETE /job`, refresh pending: the tile
+  comes from the inbox, never copied in); `waiting`/`uploading` → "Sending to Drive…" and keep polling; `failed`/`none`/absent
+  → the old claim path (`copyIn` + uploader). Never both for one job.
+- Bridge v2 (`bridge/perch-bridge.py`, API in `bridge/API.md`): keeps the token in memory only, uploads each file (resumable,
+  8 MiB chunks) and writes the same `<stem>.json` request `saveFileRequest` writes, one upload at a time, retries with
+  backoff, deletes the local files on `done`; on failure keeps only the files that didn't reach Drive and removes a video
+  whose request JSON couldn't be written. Finished jobs nobody claims are kept 7 days (failed ones 24 h). `POST /job/<id>/upload` attaches or replaces the sign-in (also revives a failed
+  upload). The daily updater also replaces the script itself (`py_compile` check, `.bak`, restart when idle), so later bridge
+  changes need no `perch-update`. `PERCH_NO_UPDATE=1`, `PERCH_BASE`, `PERCH_DRIVE_BASE` (tests) are env switches.
+- `sw.js` `VERSION = 'perch-v14'`; `js/quick.js` is in the shell list.
+
+Tests (session scratch, `v14-quick/`): `run14.sh` runs `bridge14.py` (the real bridge, yt-dlp from a local HTTP server, a fake
+Drive, in-process self-update) and `quick14.mjs` (Perch in headless Brave on the in-page mock Drive, mock bridge v2 and v1, a fake
+auth page for the renew). `window.close()` itself can only be confirmed on the phone.
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

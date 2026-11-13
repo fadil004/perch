@@ -83,7 +83,15 @@ export async function ping({ timeout = 1500 } = {}) {
   }
 }
 
-export const startDownload = (url) => json('POST', '/download', { body: { url } });
+/**
+ * `upload` ({ token, expires, folder, library, from }) lets a bridge of version 2+ send the finished file to the
+ * Drive inbox itself (see "Upload" in bridge/API.md); without it the bridge only downloads.
+ */
+export const startDownload = (url, upload = null) => json('POST', '/download', { body: upload ? { url, upload } : { url } });
+/** Hand a job started without it (or whose upload failed) the Drive sign-in to upload with. */
+export const attachUpload = (id, upload) => json('POST', `/job/${encodeURIComponent(id)}/upload`, { body: upload, timeout: 5000 });
+/** This bridge can upload to Drive itself (version 2+). */
+export const canUpload = (info) => !!(info && Number(info.version) >= 2 && info.upload);
 export const getJob = (id) => json('GET', `/job/${encodeURIComponent(id)}`, { timeout: 5000 });
 export const finishJob = (id) => json('DELETE', `/job/${encodeURIComponent(id)}`, { timeout: 5000 });
 export const pushCookies = (text, source, sourceTime = '') => json('POST', '/cookies', { body: { text, source, sourceTime } });

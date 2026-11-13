@@ -210,6 +210,16 @@ h1, h2, p { margin: 0; }
 @keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
 .sync-count { margin-top: 14px; font-size: 13px; color: var(--t2); font-variant-numeric: tabular-nums; letter-spacing: .01em; min-height: 18px; }
 
+/* ───────────────────────── Quick share (a link shared from another app: one line, then Perch closes) */
+
+.quick { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; background: var(--bg); padding: 0 32px; }
+.quick-body { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+.quick-ico { width: 40px; height: 40px; display: grid; place-items: center; color: var(--t1); }
+.quick-ico svg { width: 34px; height: 34px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; animation: quick-pop 320ms var(--ease-out); }
+.quick-ring { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--fill-2); border-top-color: var(--t1); animation: spin 800ms linear infinite; }
+.quick-text { font: 600 17px/1.3 var(--font-display); letter-spacing: -.01em; }
+@keyframes quick-pop { from { opacity: 0; transform: scale(.7); } }
+
 /* ───────────────────────── Library screen */
 
 .main { position: relative; }
@@ -1048,6 +1058,7 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
   .tile-in, .dock, .chip, .btn-primary, .v-full { transition-duration: 1ms !important; }
   .searchbar.enter { animation: none; }
   .fs, .fs.on { transform: translate(-50%, 0); }
+  .quick-ring, .quick-ico svg { animation: none; }
 }
 
 @media (prefers-reduced-transparency: reduce) {

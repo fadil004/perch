@@ -6,7 +6,8 @@ import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTr
 import { extractUrl, saveLink, saveDelete, newStem, recentLinks, siteOf } from './inbox.js';
 import { createUploader, stash, stashStream, waiting, clearWaiting } from './uploads.js';
 import { collectPending, notInLibrary } from './pending.js';
-import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError } from './bridge.js';
+import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError, canUpload } from './bridge.js';
+import { quickShare, hideQuickCard } from './quick.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive, MOCK_CACHE } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -187,7 +188,7 @@ async function boot() {
   // Installed apps get persistent storage: videos not uploaded yet and the library cache survive storage pressure.
   try { navigator.storage?.persist?.().catch(() => {}); } catch { /* not offered */ }
   const params = new URLSearchParams(location.search);
-  takeSharedLink(params);
+  const sharedLink = takeSharedLink(params);
   // The phone downloader's installer opens Perch with #bridge=<token>. Asking it right away also brings up
   // Chrome's one-time "allow access to this device" prompt now, in context.
   if (takePairing()) setTimeout(() => { toast('Phone downloader connected'); ping(); }, 400);
@@ -213,6 +214,9 @@ async function boot() {
     };
     lsSet('perch.mode', mode);
   }
+  // A link shared from another app: hand it on and close Perch (js/quick.js). Anything it can't do quietly
+  // (signed out, no write permission, downloader off or old) leaves the link in the share queue for the normal flow below.
+  if (sharedLink && !red && mode && mode.mode === 'drive') await quickShareAndClose(sharedLink);
   await swReady;
   if (!mode) return showOnboarding();
   if (mode.mode === 'demo') return startDemo(mode);
@@ -1323,10 +1327,13 @@ function askWrite({ files = true } = {}) {
   signIn({ write: true });
 }
 
-/** The share sheet opened Perch: a link (?share_url / share_text / share_title) or files (?shared=n, kept by the service worker). */
+/**
+ * The share sheet opened Perch: a link (?share_url / share_text / share_title) or files (?shared=n, kept by the service worker).
+ * Returns the link when one was queued (never for files).
+ */
 function takeSharedLink(params) {
   const keys = ['share_url', 'share_text', 'share_title'];
-  if (![...keys, 'shared'].some((k) => params.has(k))) return;
+  if (![...keys, 'shared'].some((k) => params.has(k))) return '';
   const shared = params.get('shared');
   const url = extractUrl(...keys.map((k) => params.get(k)));
   for (const k of [...keys, 'shared']) params.delete(k);
@@ -1334,8 +1341,24 @@ function takeSharedLink(params) {
   history.replaceState(null, '', location.pathname + (rest ? `?${rest}` : '') + location.hash);
   if (shared === 'failed') setTimeout(() => toast('Couldn’t receive what you shared'), 500);
   else if (shared && shared !== 'empty') lsSet(SHARE_FILES_KEY, Date.now());
-  else if (url) queuePut(url, { fresh: true });   // joins any link still waiting: several shares in a row all count
+  else if (url) { queuePut(url, { fresh: true }); return url; }   // joins any link still waiting: several shares in a row all count
   else setTimeout(() => toast('There was no link in what you shared'), 500);
+  return '';
+}
+
+/**
+ * Quick share: the card, the hand-over, then close Perch so Android returns to the app the link came from. A browser
+ * that won't let the page close itself leaves it open: then it carries on into the normal app, quietly (a toast, no Save
+ * sheet; the watcher and the tiles work as always).
+ */
+async function quickShareAndClose(url) {
+  const out = await quickShare(url, { queueDrop });
+  if (!out) return;
+  await sleep(900);
+  try { window.close(); } catch { /* not allowed */ }
+  await sleep(400);
+  hideQuickCard();   // still here: the close was blocked
+  S.quickNote = out.toast;
 }
 
 // ── the share queue: links shared to Perch that aren't saved or downloaded yet ──────────────────────────
@@ -1378,6 +1401,7 @@ function handleSharedLink() {
   if (paired()) resumeWatcher({ share: true });
   if (canSend()) for (const e of q) if (e.pc || !paired()) sendToPc(e.url, '');
   if (S.shareOpen) return;
+  if (S.quickNote) { toast(S.quickNote); S.quickNote = ''; return; }   // quick share that couldn't close: nothing to open
   // Show what's happening: new files or links, links waiting for Google's OK, or a download still going from before.
   if (newFiles || fresh.length || q.some((e) => e.pc || !paired()) || (paired() && activeJobs().some((j) => Date.now() - j.t < SHARE_TTL))) openSaveLink();
 }
@@ -1477,7 +1501,19 @@ async function pollJob(e) {
     }
     if (e.state === 'gone') return;
     if (j.title) e.title = j.title;
-    if (j.status === 'done') { claimJob(e, j); return; }
+    if (j.status === 'done') {
+      // A version-2 bridge that was handed a Drive token uploads the file itself. Never both: while it is on its way
+      // we wait; only when there's no upload (or it failed, leaving the files) is the file copied in.
+      const up = j.upload && j.upload.state;
+      if (up === 'done') { uploadedByBridge(e, j); return; }
+      if (up === 'waiting' || up === 'uploading') {
+        wSet(e, { state: 'run', text: 'Sending to Drive…', p: up === 'uploading' && j.upload.progress != null ? j.upload.progress : null });
+        await sleep(document.hidden ? 3000 : 700);
+        continue;
+      }
+      claimJob(e, j);
+      return;
+    }
     if (j.status === 'error') { jobFailed(e, j); return; }
     const [text, p] = jobText(j);
     wSet(e, { state: 'run', text, p });
@@ -1511,6 +1547,16 @@ function jobFailed(e, j) {
 function keptElsewhere(e) {
   queueDrop(e.url);
   wSet(e, { state: 'kept', text: 'Saved in another Perch window', p: 1 });
+}
+
+/** The bridge put the file and its request in the Drive inbox itself: nothing to copy in, the tile comes from the inbox. */
+function uploadedByBridge(e, j) {
+  forgetJob(e.id);
+  finishJob(e.id).catch(() => {});   // (a second Perch window does the same: harmless)
+  queueDrop(e.url);
+  wSet(e, { state: 'ready', title: j.title || '', sent: (j.upload.stems || []).length || 1, p: 1 });
+  refreshPending();
+  if (!S.shareOpen) toast('Sent to Eagle');
 }
 
 /** The download is done: copy it in (once, even with two Perch windows), then it uploads like any phone video. */
@@ -1768,7 +1814,7 @@ function openSaveLink() {
     c.title.textContent = e.title || siteOf(e.url);
     let text = e.text;
     if (e.state === 'ready') {
-      const n = Object.keys(e.kept || {}).length || 1;
+      const n = Object.keys(e.kept || {}).length || e.sent || 1;
       // It's already a tile in "All" (js/pending.js), playing from this phone until Eagle has it.
       text = `${n > 1 ? `${n} videos in` : 'In'} your library now · Eagle adds ${n > 1 ? 'them' : 'it'} on your computer`;
     }
@@ -1909,6 +1955,7 @@ function openPhoneDownloader() {
       const c = info.cookies;
       return [
         status('on', 'Connected', `yt-dlp ${info.ytdlp || '?'}${info.busy ? ` · ${info.busy} downloading` : ''}`, cookieLine(c)),
+        canUpload(info) ? null : note('Update the phone downloader: open Termux and type perch-update'),   // older ones can't send a shared link to Drive on their own
         c && c.present ? null : note('Export a cookies.txt on this phone (e.g. Firefox with the “cookies.txt” add-on, signed in to the site), then add it here.'),
         row(I.doc, 'Add cookies file', () => cookieFile.click()),
         c && c.present ? row(I.x, 'Remove cookies', removeCookies) : null,
