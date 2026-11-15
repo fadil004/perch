@@ -7,7 +7,7 @@ import { extractUrl, saveLink, saveDelete, newStem, recentLinks, siteOf } from '
 import { createUploader, stash, stashStream, waiting, clearWaiting } from './uploads.js';
 import { collectPending, notInLibrary } from './pending.js';
 import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError, canUpload } from './bridge.js';
-import { quickShare, hideQuickCard } from './quick.js';
+import { quickShare, hideQuickCard, takeQuickMarker } from './quick.js';
 import { createDrive, fetchBackend } from './drive.js';
 import { createMockDrive, MOCK_CACHE } from './mockdrive.js';
 import { discoverLibraries, resolveFolderLink, syncLibrary, Library } from './eagle.js';
@@ -215,8 +215,14 @@ async function boot() {
     lsSet('perch.mode', mode);
   }
   // A link shared from another app: hand it on and close Perch (js/quick.js). Anything it can't do quietly
-  // (signed out, no write permission, downloader off or old) leaves the link in the share queue for the normal flow below.
-  if (sharedLink && !red && mode && mode.mode === 'drive') await quickShareAndClose(sharedLink);
+  // (signed out, Google wants the user, no write permission, an old downloader) leaves the link in the share queue
+  // for the normal flow below. `back`: that share went to Google for a fresh sign-in and this is the way back.
+  const back = takeQuickMarker();
+  if (mode && mode.mode === 'drive') {
+    if (sharedLink && !red) await quickShareAndClose(sharedLink);
+    else if (back && red && red.ok) await quickShareAndClose(back.url, back);
+    else if (back && red) S.quickWhy = 'signin';
+  }
   await swReady;
   if (!mode) return showOnboarding();
   if (mode.mode === 'demo') return startDemo(mode);
@@ -1351,15 +1357,30 @@ function takeSharedLink(params) {
  * that won't let the page close itself leaves it open: then it carries on into the normal app, quietly (a toast, no Save
  * sheet; the watcher and the tiles work as always).
  */
-async function quickShareAndClose(url) {
-  const out = await quickShare(url, { queueDrop });
-  if (!out) return;
-  await sleep(900);
+async function quickShareAndClose(url, back = null) {
+  const out = await quickShare(url, { queuePut, queueDrop }, back);
+  if (out.left) {
+    // On the way to Google for a fresh sign-in; this page ends here. Still here after a while: carry on as usual.
+    await sleep(8000);
+    hideQuickCard();
+    S.quickWhy = 'signin';
+    return;
+  }
+  if (!out.ok) { S.quickWhy = out.why; return; }
+  await sleep(out.sub ? 1600 : 900);   // (a second line takes longer to read)
   try { window.close(); } catch { /* not allowed */ }
   await sleep(400);
   hideQuickCard();   // still here: the close was blocked
   S.quickNote = out.toast;
 }
+
+/** Why a shared link left Perch open instead of closing it (said once, so it isn't a mystery). */
+const QUICK_WHY = {
+  signin: 'Stayed open: Google sign-in needs a refresh',
+  old: 'Stayed open: the phone downloader needs an update',
+  inbox: 'Stayed open: couldn’t reach Google Drive',
+  error: 'Stayed open: couldn’t hand the link over',
+};
 
 // ── the share queue: links shared to Perch that aren't saved or downloaded yet ──────────────────────────
 // Kept in localStorage until the phone has the file or the link is saved for the computer, so nothing is
@@ -1402,6 +1423,11 @@ function handleSharedLink() {
   if (canSend()) for (const e of q) if (e.pc || !paired()) sendToPc(e.url, '');
   if (S.shareOpen) return;
   if (S.quickNote) { toast(S.quickNote); S.quickNote = ''; return; }   // quick share that couldn't close: nothing to open
+  if (S.quickWhy) {
+    const why = QUICK_WHY[S.quickWhy];
+    S.quickWhy = '';
+    if (why) setTimeout(() => toast(why, undefined, { ms: 3500 }), 900);   // (after the Save sheet is up, so it sits clear of it)
+  }
   // Show what's happening: new files or links, links waiting for Google's OK, or a download still going from before.
   if (newFiles || fresh.length || q.some((e) => e.pc || !paired()) || (paired() && activeJobs().some((j) => Date.now() - j.t < SHARE_TTL))) openSaveLink();
 }

@@ -150,6 +150,26 @@ Tests (session scratch, `v14-quick/`): `run14.sh` runs `bridge14.py` (the real b
 Drive, in-process self-update) and `quick14.mjs` (Perch in headless Brave on the in-page mock Drive, mock bridge v2 and v1, a fake
 auth page for the renew). `window.close()` itself can only be confirmed on the phone.
 
+## v15 — quick share with an expired sign-in
+
+v14 only closed Perch when the Google token still had 10 minutes left; most shares arrive later than that, so on the
+phone it usually fell back to the full app. Now (`js/quick.js` `handOver`):
+- The download starts first, without a token (`POST /download`, `rememberJob`, the share-queue entry gets `job`).
+- Then the sign-in: the token we have, else the hidden frame (3 s cap; a miss is remembered in `perch.quick.noframe`
+  for 3 days), else one silent page trip to Google with `signIn({ silent: true, replace: true })` (`location.replace`:
+  no history entry, so `window.close()` still works after). The trip is marked in `perch.quick`
+  (`{ url, job, off, t }`, 60 s); `boot()` reads it (`takeQuickMarker`) and finishes the hand-over on the way back.
+- With the token: `POST /job/<id>/upload` (`attachUpload`), card ✓, close. Not paired: `saveLink`, close.
+- Paired but the downloader doesn't answer: the link is saved for the computer, the card adds "Phone downloader is
+  off" and stays 1.6 s.
+- Google wants the user, no write scope, an old downloader, an error: Perch stays open as before and a toast says why
+  ("Stayed open: …", `QUICK_WHY` in `main.js`). A download already started is followed by the normal watcher.
+- Tests: `v14-quick/quick14.mjs` steps F–F6 (fake auth answers the frame and the page trip separately; history length
+  is checked across the trip). Under load the dev server sometimes leaves a module file hanging: the harness reloads
+  such a page (nothing has run yet).
+- Seen in the user's Drive inbox on 2026-11-15: the Windows plugin's last heartbeat was 2026-11-13 00:15 UTC and
+  five requests were still `pending`, so the computer side was simply not running (Eagle closed or the PC off).
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

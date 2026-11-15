@@ -82,13 +82,16 @@ function authUrl({ state, silent, write = false }) {
 /**
  * Navigate to Google. silent=true asks for a fresh token without UI (works once consent exists).
  * write=true also asks to create files (drive.file), for saving links to the Eagle inbox.
+ * replace=true goes there without adding a history entry.
  */
-export function signIn({ silent = false, write = false } = {}) {
+export function signIn({ silent = false, write = false, replace = false } = {}) {
   // WRITE_KEY is only set on the way back, once Google says drive.file was granted (see consumeRedirect).
   const state = randomState();
   lsSet(STATE_KEY, { state, silent, write, t: Date.now() });
   if (silent) lsSet(SILENT_KEY, Date.now());
-  location.assign(authUrl({ state, silent, write }));
+  const url = authUrl({ state, silent, write });
+  // replace: the trip leaves no history entry, so a page that could close itself before still can afterwards (quick share).
+  if (replace) location.replace(url); else location.assign(url);
 }
 
 /** The hidden-frame renew may work here: signed in before, nothing pending from the user, not known to fail. */
