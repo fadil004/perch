@@ -170,6 +170,31 @@ phone it usually fell back to the full app. Now (`js/quick.js` `handOver`):
 - Seen in the user's Drive inbox on 2026-11-15: the Windows plugin's last heartbeat was 2026-11-13 00:15 UTC and
   five requests were still `pending`, so the computer side was simply not running (Eagle closed or the PC off).
 
+## v16 — one request per post
+
+Apps put a new tracking tail on a link every time it is shared, so the same reel shared twice became two link requests
+(seen in the user's inbox on 2026-11-19) and would be downloaded twice.
+- `js/inbox.js` `linkKey(url)`: host + path, no query except YouTube's `v`; `youtu.be` → `youtube.com/watch?v=`; Instagram
+  `/reel/`, `/reels/`, `/p/`, `/tv/` of one post → `instagram.com/p/<id>`. `sameLink(a, b)`. `savedLately(modeKey, url,
+  library)`: posts saved for the computer in the last 24 h (`perch.inbox.saved.<modeKey>`, written by `saveLink`).
+- `main.js`: the share queue, `watchLink` and `W.saving` go by `sameLink`; `startJob` reuses a remembered job for the same
+  post; `sendToPc` skips a post saved lately ("Already saved for your computer").
+- `quick.js`: not paired / downloader off → "Already saved for your computer" (needs no sign-in); paired → a remembered job
+  for the same post is reused (checked with `GET /job`), no second download.
+- Plugin 1.5.2: `postKey` got the same rules; `linkTaken` (links of this library already queued/downloading/done) marks a
+  repeat `done` with title "Already saved". A link that failed doesn't count, so sharing it again retries it.
+
+### Tests moved next to the repo
+
+The session-scratch suites (`run.sh`, `runb.sh`, `v14-quick/`, the plugin sandbox tests) were in the system temp folder and
+were cleared by the system in November 2026. They are gone; the session's subagent transcripts
+(`~/.claude/projects/<project>/<session>/subagents`) may still hold what the agents wrote. New checks live beside the repo,
+in `../perch-tests/` (not published): `run.sh` runs `plugin-links.js` (the plugin in a sandbox with a guarded fs and a fake
+home) and `perch-links.mjs` (Perch in headless Brave on the in-page mock Drive with `mock-bridge.mjs`).
+`PERCH_DIR=<older copy> ./run.sh perch` runs them against another copy. Gotcha: on a Mac, Brave keeps the HTTP cache of a
+profile under `~/Library/Application Support` in a twin folder under `~/Library/Caches`; `run.sh` pins the cache inside the
+profile and removes the twin, otherwise an older copy of the app is answered from the cache (304).
+
 ## Video Grabber plugin (Eagle) — not in this repo
 
 The user's own plugin (Eagle 4 service plugin with yt-dlp, Telegram queue, browser extension for

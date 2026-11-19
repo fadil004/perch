@@ -3,7 +3,7 @@ import { $, h, clamp, debounce, lsGet, lsSet, timeAgo, fmtBytes, rubberband, red
 import { I } from './icons.js';
 import { kv, swkv, wipeAll } from './store.js';
 import { hasClientId, signIn, consumeRedirect, tokenValid, token, getAuth, canTrySilent, expireToken, signOut, redirectUri, tokenLeft, rememberAccount, RENEW_AHEAD, NEEDS_USER, renewInFrame, frameRenewAllowed, canWrite } from './auth.js';
-import { extractUrl, saveLink, saveDelete, newStem, recentLinks, siteOf } from './inbox.js';
+import { extractUrl, saveLink, saveDelete, newStem, recentLinks, siteOf, linkKey, sameLink, savedLately } from './inbox.js';
 import { createUploader, stash, stashStream, waiting, clearWaiting } from './uploads.js';
 import { collectPending, notInLibrary } from './pending.js';
 import { takePairing, paired, ping, pingProblem, startDownload, getJob, finishJob, fetchFile, pushCookies, clearCookies, activeJobs, rememberJob, forgetJob, siteNames, BridgeError, canUpload } from './bridge.js';
@@ -1394,12 +1394,12 @@ function shareQueue() {
 function saveQueue(q) { lsSet(SHARE_KEY, q.length ? q : null); }
 function queuePut(url, patch = {}) {
   const q = shareQueue();
-  const e = q.find((x) => x.url === url);
+  const e = q.find((x) => sameLink(x.url, url));   // the same post shared again (apps change the link's tail every time) is one entry
   if (e) Object.assign(e, patch); else q.push({ url, t: Date.now(), ...patch });
   saveQueue(q);
 }
-function queueDrop(url) { saveQueue(shareQueue().filter((x) => x.url !== url)); }
-const inQueue = (url) => shareQueue().some((x) => x.url === url);
+function queueDrop(url) { saveQueue(shareQueue().filter((x) => !sameLink(x.url, url))); }
+const inQueue = (url) => shareQueue().some((x) => sameLink(x.url, url));
 
 /** Something was just shared: "All" is where its tile shows. */
 function showAll() {
@@ -1469,7 +1469,7 @@ function resumeWatcher({ share = false } = {}) {
 
 /** Download a link on this phone. `cancellable`: closing the sheet before the job exists cancels it. */
 function watchLink(url, { cancellable = false } = {}) {
-  const same = W.list.find((x) => x.url === url && !ENDED.has(x.state));
+  const same = W.list.find((x) => sameLink(x.url, url) && !ENDED.has(x.state));
   if (same) return same;
   const e = { key: `w${++W.n}`, url, id: '', lib: S.lib, state: 'start', text: 'Starting…', p: null, title: '', cancellable };
   W.list.push(e);
@@ -1493,7 +1493,9 @@ async function startJob(e) {
   if (e.state === 'gone') return;
   if (!info) { giveUp(e, pingProblem() === 'auth' ? 'auth' : 'off'); return; }
   try {
-    ({ id: e.id } = await startDownload(e.url));
+    // The same post may already be downloading (shared twice: its link differs only in the tracking tail).
+    const twin = activeJobs().find((j) => sameLink(j.url, e.url));
+    e.id = twin ? twin.id : (await startDownload(e.url)).id;
   } catch (err) {
     giveUp(e, err.code === 'auth' ? 'auth' : err.code === 'off' ? 'off' : 'job', err.message);
     return;
@@ -1662,8 +1664,15 @@ async function sendToPc(url, why = '', { ask = false } = {}) {
     note('wait', why);
     return;
   }
-  if (W.saving.has(url)) return;
-  W.saving.add(url);
+  const key = linkKey(url) || url;
+  if (W.saving.has(key)) return;
+  if (savedLately(S.modeKey, url, S.lib)) {   // this post went to the computer already today: once is enough
+    queueDrop(url);
+    note('saved');
+    if (!S.shareOpen) toast('Already saved for your computer');
+    return;
+  }
+  W.saving.add(key);
   note('saving');
   try {
     await saveLink(S.drive, S.modeKey, { url, library: S.lib });
@@ -1676,7 +1685,7 @@ async function sendToPc(url, why = '', { ask = false } = {}) {
     if (e.name === 'AuthError') note('auth', 'Google sign-in expired.');
     else note('fail', e.message || 'Couldn’t save the link');
   } finally {
-    W.saving.delete(url);
+    W.saving.delete(key);
   }
 }
 W.saving = new Set();

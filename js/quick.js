@@ -14,8 +14,8 @@ import { h, lsGet, lsSet } from './util.js';
 import { I } from './icons.js';
 import { getAuth, tokenLeft, canWrite, renewInFrame, frameRenewAllowed, canTrySilent, signIn, token, RENEW_AHEAD } from './auth.js';
 import { createDrive, fetchBackend } from './drive.js';
-import { withInbox, saveLink } from './inbox.js';
-import { paired, ping, startDownload, attachUpload, rememberJob, canUpload } from './bridge.js';
+import { withInbox, saveLink, sameLink, savedLately } from './inbox.js';
+import { paired, ping, startDownload, attachUpload, rememberJob, canUpload, activeJobs, forgetJob, getJob } from './bridge.js';
 
 const RENEW_CAP = 3000;     // the hidden-frame renew gets this long, no more: the card is on screen meanwhile
 const INBOX_CAP = 4000;     // finding the inbox folder
@@ -113,12 +113,31 @@ async function handOver(url, { queuePut, queueDrop }, back) {
     off = !info;   // paired but not answering: the link goes to the computer instead
   }
 
+  // This post went to the computer already today (shared twice): once is enough, and it needs no sign-in to say so.
+  if (!phone && savedLately('drive', url, lib)) {
+    queueDrop(url);
+    return done('Already saved for your computer', off ? 'Phone downloader is off' : '');
+  }
+
+  let twin = false;   // the same post is already in the phone downloader (shared twice): no second download
+  if (phone && !job) {
+    const before = activeJobs().find((j) => sameLink(j.url, url));
+    if (before) {
+      try {
+        const j = await getJob(before.id);
+        if (j.status !== 'error') { job = before.id; twin = j.status === 'done' ? 'done' : true; }
+        else forgetJob(before.id);
+      } catch { forgetJob(before.id); }
+    }
+  }
+  const took = () => done(twin === 'done' ? 'Already saved' : 'Downloading on your phone');
+
   if (phone && !job) {
     // Start downloading now. With a sign-in that's still good the upload details go along; otherwise they follow.
     const upload = good(a0) ? await uploadInfo(a0, libName) : null;
     ({ id: job } = await startDownload(url, upload));
     rememberJob(job, url, libName);   // the normal watcher finds it on the next open (and reads the upload's outcome)
-    if (upload) { queueDrop(url); return done('Downloading on your phone'); }
+    if (upload) { queueDrop(url); return took(); }
     queuePut(url, { job });   // if the sign-in fails now, the normal flow follows this download, not a second one
   }
 
@@ -138,7 +157,7 @@ async function handOver(url, { queuePut, queueDrop }, back) {
     if (!upload) return fall('inbox');
     await attachUpload(job, upload);
     queueDrop(url);
-    return done('Downloading on your phone');
+    return took();
   }
   await within(saveLink(driveFor(), 'drive', { url, library: lib }), SAVE_CAP);
   queueDrop(url);

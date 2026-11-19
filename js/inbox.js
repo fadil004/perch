@@ -78,12 +78,49 @@ export async function withInbox(drive, modeKey, fn) {
 const libraryName = (library) => (library ? library.name.replace(/\.library$/i, '') : '');
 export const newStem = (t = Date.now()) => `${t}-${Math.random().toString(36).slice(2, 8).padEnd(6, '0')}`;
 
+/**
+ * What makes two links the same post: the host without www/m and the path, and nothing of the query (apps put a
+ * new tracking code there on every share) except YouTube's video id. Instagram's /reel/, /reels/, /p/ and /tv/
+ * addresses of one post count as one. Video Grabber uses the same key (postKey in perch-inbox.js). '' if unreadable.
+ */
+export function linkKey(url) {
+  try {
+    const x = new URL(url);
+    const host = x.hostname.toLowerCase().replace(/^(www|m|mobile)\./, '');
+    const p = x.pathname.replace(/\/+$/, '');
+    if (host === 'youtu.be' && p.length > 1) return `youtube.com/watch?v=${p.slice(1)}`;
+    if (/(^|\.)youtube\.com$/.test(host) && p === '/watch') return `${host}/watch?v=${x.searchParams.get('v') || ''}`;
+    if (/(^|\.)instagram\.com$/.test(host)) {
+      const m = /\/(?:reel|reels|p|tv)\/([^/]+)/.exec(p);
+      if (m) return `instagram.com/p/${m[1]}`;
+    }
+    return host + p;
+  } catch {
+    return '';
+  }
+}
+/** Two shared links point at the same post. */
+export const sameLink = (a, b) => a === b || (!!linkKey(a) && linkKey(a) === linkKey(b));
+
+// Posts saved for the computer in the last day, so the same post shared again isn't written (and downloaded) twice.
+const SAVED_FOR = 24 * 3600_000;
+const savedKey = (modeKey) => `perch.inbox.saved.${modeKey}`;
+const savedId = (url, library) => `${libraryName(library)}|${linkKey(url) || url}`;
+function savedMap(modeKey) {
+  const m = lsGet(savedKey(modeKey)) || {};
+  for (const k of Object.keys(m)) if (Date.now() - m[k] > SAVED_FOR) delete m[k];
+  return m;
+}
+export const savedLately = (modeKey, url, library) => !!savedMap(modeKey)[savedId(url, library)];
+
 /** Save one link for Eagle (Video Grabber downloads it on the computer). Resolves with the created Drive file. */
 export async function saveLink(drive, modeKey, { url, library }) {
   const request = { v: 1, url, library: libraryName(library), sentAt: new Date().toISOString(), from: 'Perch', status: 'pending' };
   const body = JSON.stringify(request, null, 2);
   const name = `${newStem()}.json`;
-  return withInbox(drive, modeKey, (folder) => drive.createFile(name, [folder], body));
+  const file = await withInbox(drive, modeKey, (folder) => drive.createFile(name, [folder], body));
+  lsSet(savedKey(modeKey), { ...savedMap(modeKey), [savedId(url, library)]: Date.now() });
+  return file;
 }
 
 /**
