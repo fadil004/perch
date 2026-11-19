@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Perch — Privacy</title>
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<style>
+  :root { --bg: #000; --t1: #f5f5f7; --t2: #a1a1a6; --line: #2c2c2e; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--t1); font: 400 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; -webkit-text-size-adjust: 100%; }
+  main { max-width: 680px; margin: 0 auto; padding: 48px 20px 72px; }
+  h1 { margin: 0 0 4px; font-size: 30px; line-height: 1.2; letter-spacing: -.02em; }
+  h2 { margin: 36px 0 8px; font-size: 18px; line-height: 1.3; }
+  p, ul { margin: 0 0 12px; color: var(--t2); }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 6px; }
+  strong { color: var(--t1); font-weight: 600; }
+  a { color: var(--t1); }
+  .date { color: var(--t2); font-size: 14px; margin-bottom: 28px; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 36px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Perch — Privacy</h1>
+  <p class="date">Last updated: 19 November 2026</p>
+
+  <p>Perch is a web app that shows the Eagle reference library you keep in your own Google Drive. It runs
+  entirely in your browser. <strong>Perch has no server of its own, and its developer receives none of your
+  data</strong>: not your files, not your account details, not usage statistics.</p>
+
+  <h2>What Perch accesses in your Google account</h2>
+  <ul>
+    <li><strong>Read-only access to your Google Drive files</strong> — to find your Eagle library and show its
+    images, videos and their details.</li>
+    <li><strong>Your Google account email address</strong> — used only on your device, to recognise which
+    account is connected.</li>
+    <li><strong>Creating and changing files Perch itself made</strong> (optional, asked the first time you save
+    something) — a folder named “Perch Inbox” in your Drive, where the links and videos you share from your
+    phone, and delete requests, wait for Eagle on your computer.</li>
+  </ul>
+
+  <h2>Where your data goes</h2>
+  <p>Directly between your browser and Google’s servers, and nowhere else. Nothing is sent to the developer or
+  to any third party. Perch does not sell, share or transfer your Google data, does not use it for advertising,
+  and does not use it to train AI models.</p>
+  <p>Perch’s use of information received from Google APIs adheres to the
+  <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data
+  Policy</a>, including the Limited Use requirements.</p>
+
+  <h2>What is kept on your device</h2>
+  <ul>
+    <li>A Google access token, which expires after about an hour.</li>
+    <li>A cached copy of your library’s index, thumbnails and recently played videos, so it opens quickly.</li>
+    <li>Videos you shared that are still waiting to upload to your Drive.</li>
+  </ul>
+  <p>Signing out in Perch, or clearing the site’s data in your browser, removes them.</p>
+
+  <h2>The optional phone downloader</h2>
+  <p>If you install it, it runs on your own phone. A link you share is downloaded there, straight from the site
+  it comes from, and uploaded to your own Drive. A cookies file you add stays on the phone. The Google access
+  token it uses for the upload is held in memory only and is never written to disk.</p>
+
+  <h2>Other services</h2>
+  <ul>
+    <li>Perch’s files are hosted on GitHub Pages; like any web host, GitHub may log requests (such as your IP
+    address).</li>
+    <li>If a saved reference is a YouTube or Vimeo link, its player is loaded from that site when you open it.</li>
+  </ul>
+
+  <h2>Removing Perch’s access</h2>
+  <p>Choose Sign out in Perch, or remove Perch at
+  <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>. You can delete the
+  “Perch Inbox” folder from your Drive at any time.</p>
+
+  <h2>Contact</h2>
+  <p>Questions: open an issue at <a href="https://github.com/fadil004/perch/issues">github.com/fadil004/perch</a>.</p>
+
+  <hr>
+</main>
+</body>
+</html>
