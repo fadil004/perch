@@ -6,7 +6,7 @@ Start a new Claude Code session in a clone of this repo and ask it to read this 
 
 A static PWA (vanilla JS, no build step) that shows Eagle reference libraries stored in Google Drive.
 Live at GitHub Pages (`main` branch, repo root). Google Cloud only holds the OAuth client ID
-(Testing mode, test users); the app itself is not hosted there.
+(published 2026-11-19, unverified; before that Testing mode with test users); the app itself is not hosted there.
 
 - `js/main.js` boot, screens, sync, sheets, token renewal, Save to Eagle
 - `js/auth.js` OAuth implicit flow: redirect sign-in, hidden-frame silent renew, `drive.file` opt-in
@@ -201,7 +201,10 @@ Plugin 1.4.0 (`perch-inbox.js`):
 ## Open items
 
 - Confirm the background renew on the phone (no more "Refreshing…" flashes after an hour).
-- Testing mode still forces a full reconnect every 7 days; "Publish app" (unverified) would lift that.
+- OAuth app publishing: on 2026-11-19 the 7-day Testing-mode cut hit the user (quick share stayed open with
+  "Google sign-in needs a refresh"). `privacy.html` was added for the Branding page (home page, privacy policy,
+  authorized domain `fadil004.github.io`) and the user pressed "Publish app" (In production, unverified: warning
+  screen once, 100-user cap, no weekly cut). Not checked from here; confirm no Reconnect is asked after 7 days.
 - A refresh-token backend (e.g. a free Cloudflare Worker holding the client secret) would remove
   hourly renewals entirely; not built.
 - Dropbox support: agreed for after Drive, not started.
