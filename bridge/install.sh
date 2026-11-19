@@ -90,7 +90,8 @@ done
 
 say "Done. Opening Perch to connect it…"
 echo "If Chrome asks to let the site reach devices / apps on this phone, tap Allow."
-echo "Keep Termux in the background. Settings → Apps → Termux → Battery → Unrestricted keeps it alive."
+echo "If Android asks to let Termux always run in the background, tap Allow."
+echo "Keep Termux in the background. If it keeps stopping: Settings → Apps → Termux → Battery → Unrestricted."
 perch-pair
 }
 

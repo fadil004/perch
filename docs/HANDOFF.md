@@ -184,6 +184,15 @@ Apps put a new tracking tail on a link every time it is shared, so the same reel
 - Plugin 1.5.2: `postKey` got the same rules; `linkTaken` (links of this library already queued/downloading/done) marks a
   repeat `done` with title "Already saved". A link that failed doesn't count, so sharing it again retries it.
 
+### v17 — shorter phone-downloader setup
+
+The user wants to keep Termux (a web page can't download from Instagram, a cloud server gets blocked, and he didn't want
+a second app) but with fewer steps. `openBridgeSetup()` is now three steps: "Download Termux" (the arm64 APK of the
+latest GitHub release, looked up through `api.github.com`; falls back to the releases page), paste the command, tap Allow
+(Termux asks for the battery exemption itself when `termux-wake-lock` runs; Chrome asks for local network access). The
+Settings → Battery path moved to the "Off" state as a fallback. `install.sh` says the same. Instagram's `/embed/` pages
+answer `X-Frame-Options: DENY`, so a saved link can't be played inside Perch before it is downloaded.
+
 ### Tests moved next to the repo
 
 The session-scratch suites (`run.sh`, `runb.sh`, `v14-quick/`, the plugin sandbox tests) were in the system temp folder and

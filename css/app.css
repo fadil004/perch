@@ -1114,6 +1114,10 @@ body.searching .content { padding-top: calc(var(--search-h, 54px) + 6px); }
 .dl-status .link-title { font-weight: 600; }
 .dl-status .link-meta { white-space: normal; margin-top: 3px; line-height: 1.4; }
 .dl-note { padding: 6px 14px 4px; }
+.cmd-get { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; min-height: 36px; color: var(--t1); font-size: 15px; font-weight: 600; text-decoration: none; }
+.cmd-get .ico { width: 20px; height: 20px; flex: none; }
+.step-t a.cmd-get { color: var(--t1); }
+.cmd-other { flex: none; padding: 0 8px; font-size: 13px; }
 .step-t a { color: #0a84ff; text-decoration: none; }
 .cmd { display: flex; align-items: center; gap: 8px; margin: 8px 0 2px; padding: 8px 8px 8px 12px; border-radius: 12px; background: var(--fill); }
 .cmd code { flex: 1; min-width: 0; font: 500 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--t1); word-break: break-all; -webkit-user-select: all; user-select: all; }

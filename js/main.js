@@ -1959,7 +1959,8 @@ function jobText(j) {
 // yt-dlp in Termux on the phone (js/bridge.js). Android only; the row shows elsewhere once it's paired.
 const ANDROID = /Android/i.test(navigator.userAgent);
 const INSTALL_CMD = 'curl -fsSL https://fadil004.github.io/perch/bridge/install.sh | bash';
-const TERMUX_URL = 'https://github.com/termux/termux-app/releases';
+const TERMUX_URL = 'https://github.com/termux/termux-app/releases/latest';
+const TERMUX_LATEST = 'https://api.github.com/repos/termux/termux-app/releases/latest';
 
 function cookieLine(c) {
   if (!c || !c.present) return 'No cookies — Instagram and X may need them';
@@ -2007,6 +2008,7 @@ function openPhoneDownloader() {
     return [
       status('error', 'Off — open Termux', 'Links are saved for your computer meanwhile'),
       note('Open Termux to start it. Still off with Termux open? Chrome may be blocking it: allow “Local network access” for this site in Chrome’s site settings.'),
+      note('Does it keep stopping? Settings → Apps → Termux → Battery → Unrestricted. After restarting the phone, open Termux once.'),
       row(I.sync, 'Try again', () => { sheet.setBody(h('div', { class: 'group-label' }, 'Checking…')); refresh(); }),
       row(I.download, 'Setup steps', () => openBridgeSetup()),
     ];
@@ -2044,18 +2046,33 @@ function openBridgeSetup() {
     }
   } }, h('span', { class: 'ico', html: I.copy }), 'Copy');
   const step = (n, ...parts) => h('li', null, h('span', { class: 'step-n' }, String(n)), h('span', { class: 'step-t' }, ...parts));
+  const get = h('a', { class: 'cmd-get', href: TERMUX_URL, target: '_blank', rel: 'noopener' }, h('span', { class: 'ico', html: I.download }), 'Download Termux');
   openSheet({
     title: 'Set up the phone downloader',
     sub: 'Once, on this phone. Takes a couple of minutes.',
     body: [
       h('ol', { class: 'steps' },
-        step(1, 'Install ', h('b', null, 'Termux'), ' from F-Droid or ', h('a', { href: TERMUX_URL, target: '_blank', rel: 'noopener' }, 'GitHub'), '.'),
-        step(2, 'Open Termux.'),
-        step(3, 'Paste this command and press Enter:', h('div', { class: 'cmd' }, code, copy)),
-        step(4, 'Settings → Apps → Termux → Battery → ', h('b', null, 'Unrestricted'), ', so Android doesn’t stop it.')),
+        step(1, 'Get ', h('b', null, 'Termux'), ': download it and open the file to install.', h('small', null, 'Android asks once to allow installing from Chrome.'),
+          h('div', { class: 'cmd' }, get, h('a', { class: 'cmd-other', href: TERMUX_URL, target: '_blank', rel: 'noopener' }, 'Other versions'))),
+        step(2, 'Open Termux, paste this command and press Enter:', h('div', { class: 'cmd' }, code, copy)),
+        step(3, 'Tap ', h('b', null, 'Allow'), ' when Android asks to let Termux run in the background, and when Chrome asks to reach this phone.')),
       h('p', { class: 'link-note dl-note' }, 'When it finishes, Perch opens and says “Phone downloader connected”. Leave Termux running in the background.'),
     ],
   });
+  // The newest Termux for today's phones (64-bit ARM), straight from its makers: one tap instead of a list to choose from.
+  termuxApk().then((url) => { if (url) get.href = url; });
+}
+
+/** The direct download of the latest Termux (arm64) from its GitHub releases, or '' (the link then opens the releases page). */
+async function termuxApk() {
+  try {
+    const res = await fetch(TERMUX_LATEST, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!res.ok) return '';
+    const hit = ((await res.json()).assets || []).find((a) => /arm64-v8a\.apk$/.test(a.name || ''));
+    return hit && /^https:\/\/github\.com\/termux\/termux-app\//.test(hit.browser_download_url || '') ? hit.browser_download_url : '';
+  } catch {
+    return '';
+  }
 }
 
 async function confirmSignOut() {
